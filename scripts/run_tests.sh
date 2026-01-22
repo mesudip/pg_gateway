@@ -57,6 +57,12 @@ install_deps() {
     pip install -r "$PROJECT_ROOT/requirements.txt"
 }
 
+# Function to save gateway logs
+save_gateway_logs() {
+    print_status "Saving gateway container logs to $REPORTS_DIR/test.log..."
+    docker logs pg_gateway > "$REPORTS_DIR/test.log" 2>&1 || print_warning "Could not retrieve gateway logs"
+}
+
 # Function to run all tests
 run_all_tests() {
     print_status "Running all tests..."
@@ -65,6 +71,7 @@ run_all_tests() {
         --html="$REPORTS_DIR/test_report.html" \
         --self-contained-html \
         -v
+    save_gateway_logs
 }
 
 # Function to run connection tests only
@@ -75,6 +82,7 @@ run_connection_tests() {
         --html="$REPORTS_DIR/connection_report.html" \
         --self-contained-html \
         -v
+    save_gateway_logs
 }
 
 # Function to run failover tests only
@@ -85,6 +93,7 @@ run_failover_tests() {
         --html="$REPORTS_DIR/failover_report.html" \
         --self-contained-html \
         -v -m failover
+    save_gateway_logs
 }
 
 # Function to run benchmarks
@@ -107,6 +116,7 @@ run_benchmarks() {
         python3 "$PROJECT_ROOT/scripts/generate_benchmark_report.py" \
             "$REPORTS_DIR/benchmark.json" "$REPORTS_DIR/benchmark_table.html"
     fi
+    save_gateway_logs
 }
 
 # Function to run quick tests (skip slow ones)
@@ -118,6 +128,7 @@ run_quick_tests() {
         --html="$REPORTS_DIR/quick_report.html" \
         --self-contained-html \
         -v
+    save_gateway_logs
 }
 
 # Function to start the cluster manually

@@ -42,12 +42,14 @@ ENV PGPASSWORD=""
 ENV PGDATABASE="postgres"
 ENV LISTEN_HOST="::"
 ENV LISTEN_PORT="5432"
+ENV METRICS_HOST="::"
+ENV METRICS_PORT="9090"
 
 # Run as non-root user
 USER pggateway
 
-# Expose the gateway port
-EXPOSE 5432
+# Expose the gateway port and metrics port
+EXPOSE 5432 9090
 
 # Start the load balancer (reads LISTEN_HOST and LISTEN_PORT from env)
 ENTRYPOINT ["/usr/local/bin/pg_gateway"]
