@@ -10,7 +10,8 @@ BUILD_DIR = build
 TARGET = $(BUILD_DIR)/pg_gateway
 TARGET_STATIC = $(BUILD_DIR)/pg_gateway-static
 
-SOURCES = $(SRC_DIR)/gateway.c
+SOURCES = $(SRC_DIR)/main.c $(SRC_DIR)/gateway.c $(SRC_DIR)/health_check.c
+OBJECTS = $(BUILD_DIR)/main.o $(BUILD_DIR)/gateway.o $(BUILD_DIR)/health_check.o
 
 .PHONY: all clean install static venv test
 
@@ -59,11 +60,14 @@ static: $(TARGET_STATIC)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(TARGET): $(SOURCES) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c $(SRC_DIR)/gateway.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(TARGET_STATIC): $(SOURCES) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -static -o $@ $< $(STATIC_LDFLAGS)
+$(TARGET): $(OBJECTS)
+	$(CC) $(CFLAGS) -o $@ $(OBJECTS) $(LDFLAGS)
+
+$(TARGET_STATIC): $(OBJECTS)
+	$(CC) $(CFLAGS) -static -o $@ $(OBJECTS) $(STATIC_LDFLAGS)
 
 clean:
 	rm -rf $(BUILD_DIR)
