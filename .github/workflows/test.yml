@@ -1,0 +1,91 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/requirements.txt
+
+      - name: Start Patroni cluster
+        run: |
+          docker compose -f tests/docker-compose-patroni.yml up -d --build
+          echo "Waiting for cluster to be healthy..."
+          sleep 90
+
+      - name: Run connection tests
+        run: |
+          pytest tests/src/test_connection.py \
+            --html=reports/connection_report.html \
+            --self-contained-html \
+            -v
+
+      - name: Run failover tests
+        run: |
+          pytest tests/src/test_failover.py \
+            --html=reports/failover_report.html \
+            --self-contained-html \
+            -v -m failover
+
+      - name: Run all tests
+        run: |
+          pytest tests/src/ \
+            --html=reports/test_report.html \
+            --self-contained-html \
+            -v
+
+      - name: Stop cluster
+        if: always()
+        run: docker compose -f tests/docker-compose-patroni.yml down -v
+
+      - name: Prepare reports for pages
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        run: |
+          mkdir -p gh-pages/tests
+          cp reports/*.html gh-pages/tests/ 2>/dev/null || true
+          # Create index
+          cat > gh-pages/tests/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>pg_gateway Test Reports</title>
+          <style>body{font-family:sans-serif;margin:40px;} a{display:block;padding:8px;}</style>
+          </head>
+          <body>
+          <h1>pg_gateway Test Reports</h1>
+          <a href="test_report.html">All Tests</a>
+          <a href="connection_report.html">Connection Tests</a>
+          <a href="failover_report.html">Failover Tests</a>
+          <a href="../index.html">Back to Reports Home</a>
+          </body>
+          </html>
+          EOF
+
+      - name: Deploy to GitHub Pages (tests)
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./gh-pages
+          keep_files: true
+          destination_dir: .

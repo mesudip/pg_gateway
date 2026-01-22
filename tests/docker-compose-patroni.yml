@@ -1,0 +1,174 @@
+# Docker Compose for pg_gateway testing with Patroni cluster
+# Based on official Patroni docker-compose.yml from https://github.com/patroni/patroni
+#
+# Requires building the patroni image first:
+#   docker build -t patroni ./patroni-repo
+#
+# Then start the cluster:
+#   docker compose -f docker-compose-patroni.yml up -d --build
+
+networks:
+  pg_network:
+    driver: bridge
+
+services:
+  # 3-node etcd cluster
+  etcd1: &etcd
+    image: patroni
+    build:
+      context: ../patroni-repo
+      dockerfile: Dockerfile
+    networks: [ pg_network ]
+    environment:
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: pg_gateway_test
+      ETCD_UNSUPPORTED_ARCH: arm64
+    container_name: etcd1
+    hostname: etcd1
+    command: etcd --name etcd1 --initial-advertise-peer-urls http://etcd1:2380
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  etcd2:
+    <<: *etcd
+    container_name: etcd2
+    hostname: etcd2
+    command: etcd --name etcd2 --initial-advertise-peer-urls http://etcd2:2380
+
+  etcd3:
+    <<: *etcd
+    container_name: etcd3
+    hostname: etcd3
+    command: etcd --name etcd3 --initial-advertise-peer-urls http://etcd3:2380
+
+  # HAProxy for primary/replica endpoint access (optional, for direct testing)
+  haproxy:
+    image: patroni
+    networks: [ pg_network ]
+    hostname: haproxy
+    container_name: haproxy
+    ports:
+      - "5000:5000"  # Primary
+      - "5001:5001"  # Replicas
+    command: haproxy
+    environment: &haproxy_env
+      ETCDCTL_ENDPOINTS: http://etcd1:2379,http://etcd2:2379,http://etcd3:2379
+      PATRONI_ETCD3_HOSTS: "'etcd1:2379','etcd2:2379','etcd3:2379'"
+      PATRONI_SCOPE: demo
+      PATRONI_RESTAPI_USERNAME: admin
+      PATRONI_RESTAPI_PASSWORD: admin
+      PATRONI_SUPERUSER_USERNAME: postgres
+      PATRONI_SUPERUSER_PASSWORD: postgres
+      PATRONI_REPLICATION_USERNAME: replicator
+      PATRONI_REPLICATION_PASSWORD: replicate
+      PATRONI_admin_PASSWORD: admin
+      PATRONI_admin_OPTIONS: createdb,createrole
+    depends_on:
+      - etcd1
+      - etcd2
+      - etcd3
+
+  # Patroni node 1
+  patroni1:
+    image: patroni
+    networks: [ pg_network ]
+    hostname: patroni1
+    container_name: patroni1
+    ports:
+      - "5433:5432"
+      - "8008:8008"
+    environment:
+      <<: *haproxy_env
+      PATRONI_NAME: patroni1
+    depends_on:
+      - etcd1
+      - etcd2
+      - etcd3
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Patroni node 2
+  patroni2:
+    image: patroni
+    networks: [ pg_network ]
+    hostname: patroni2
+    container_name: patroni2
+    ports:
+      - "5434:5432"
+      - "8009:8008"
+    environment:
+      <<: *haproxy_env
+      PATRONI_NAME: patroni2
+    depends_on:
+      - etcd1
+      - etcd2
+      - etcd3
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Patroni node 3
+  patroni3:
+    image: patroni
+    networks: [ pg_network ]
+    hostname: patroni3
+    container_name: patroni3
+    ports:
+      - "5435:5432"
+      - "8010:8008"
+    environment:
+      <<: *haproxy_env
+      PATRONI_NAME: patroni3
+    depends_on:
+      - etcd1
+      - etcd2
+      - etcd3
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # pg_gateway load balancer
+  pg_gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: pg_gateway
+    hostname: pg_gateway
+    environment:
+      - CANDIDATES=patroni1:5432,patroni2:5432,patroni3:5432
+      - PGUSER=postgres
+      - PGPASSWORD=postgres
+      - PGDATABASE=postgres
+    ports:
+      - "6432:6432"
+    networks:
+      - pg_network
+    depends_on:
+      patroni1:
+        condition: service_healthy
+      patroni2:
+        condition: service_healthy
+      patroni3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 6432 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

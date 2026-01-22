@@ -1,0 +1,39 @@
+# Build artifacts
+build/
+*.o
+
+# Cloned repos
+/patroni-repo/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+
+# Test reports
+reports/
+.benchmarks/
+*.html
+benchmark.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docker
+.docker/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

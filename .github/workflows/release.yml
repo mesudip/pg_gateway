@@ -1,0 +1,232 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    name: Build ${{ matrix.arch }} binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            cc: gcc
+            target: x86_64-linux-gnu
+          - arch: arm64
+            cc: aarch64-linux-gnu-gcc
+            target: aarch64-linux-gnu
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libpq-dev \
+            libssl-dev \
+            zlib1g-dev
+          
+          # Install cross-compilation tools for ARM
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            sudo apt-get install -y \
+              gcc-aarch64-linux-gnu \
+              g++-aarch64-linux-gnu \
+              libpq-dev:arm64 \
+              libssl-dev:arm64 \
+              zlib1g-dev:arm64
+            
+            # Add ARM architecture
+            sudo dpkg --add-architecture arm64
+            sudo apt-get update
+          fi
+
+      - name: Build dynamic binary
+        env:
+          CC: ${{ matrix.cc }}
+        run: |
+          make clean
+          make all
+          mv build/pg_gateway build/pg_gateway-${{ matrix.arch }}
+
+      - name: Build static binary
+        env:
+          CC: ${{ matrix.cc }}
+        run: |
+          make clean
+          make static
+          mv build/pg_gateway-static build/pg_gateway-${{ matrix.arch }}-static
+
+      - name: Create package structure
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          
+          # Create .deb structure
+          mkdir -p pkg-deb/usr/local/bin
+          mkdir -p pkg-deb/DEBIAN
+          cp build/pg_gateway-${{ matrix.arch }} pkg-deb/usr/local/bin/pg_gateway
+          chmod 755 pkg-deb/usr/local/bin/pg_gateway
+          
+          cat > pkg-deb/DEBIAN/control << EOF
+          Package: pg-gateway
+          Version: ${VERSION}
+          Section: database
+          Priority: optional
+          Architecture: ${{ matrix.arch }}
+          Depends: libpq5
+          Maintainer: Sudip Bhattarai <sudipbhattarai@github>
+          Description: High-performance PostgreSQL load balancer
+           Lightweight TCP proxy for automatic PostgreSQL primary routing.
+           Built with epoll and splice for zero-copy forwarding.
+          EOF
+          
+          dpkg-deb --build pkg-deb pg_gateway-${VERSION}-${{ matrix.arch }}.deb
+          
+          # Create .rpm structure
+          mkdir -p pkg-rpm/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          mkdir -p pkg-rpm/SOURCES/usr/local/bin
+          cp build/pg_gateway-${{ matrix.arch }} pkg-rpm/SOURCES/usr/local/bin/pg_gateway
+          
+          cat > pkg-rpm/SPECS/pg_gateway.spec << EOF
+          Name: pg_gateway
+          Version: ${VERSION}
+          Release: 1%{?dist}
+          Summary: High-performance PostgreSQL load balancer
+          License: MIT
+          URL: https://github.com/mesudip/pg_gateway
+          BuildArch: ${{ matrix.arch == 'amd64' && 'x86_64' || 'aarch64' }}
+          Requires: postgresql-libs
+          
+          %description
+          Lightweight TCP proxy for automatic PostgreSQL primary routing.
+          Built with epoll and splice for zero-copy forwarding.
+          
+          %install
+          mkdir -p %{buildroot}/usr/local/bin
+          cp %{_sourcedir}/usr/local/bin/pg_gateway %{buildroot}/usr/local/bin/
+          
+          %files
+          /usr/local/bin/pg_gateway
+          
+          %changelog
+          * $(date '+%a %b %d %Y') Sudip Bhattarai <sudipbhattarai@github> - ${VERSION}-1
+          - Release ${VERSION}
+          EOF
+          
+          # Build RPM (simplified for GitHub Actions)
+          sudo apt-get install -y rpm
+          cd pkg-rpm
+          rpmbuild --define "_topdir $(pwd)" -bb SPECS/pg_gateway.spec || true
+          cd ..
+          
+          # If RPM build succeeded, move it
+          if [ -f pkg-rpm/RPMS/${{ matrix.arch == 'amd64' && 'x86_64' || 'aarch64' }}/pg_gateway-${VERSION}-1*.rpm ]; then
+            mv pkg-rpm/RPMS/${{ matrix.arch == 'amd64' && 'x86_64' || 'aarch64' }}/pg_gateway-${VERSION}-1*.rpm \
+               pg_gateway-${VERSION}-${{ matrix.arch }}.rpm
+          else
+            # Fallback: create tar.gz if RPM fails
+            tar -czf pg_gateway-${VERSION}-${{ matrix.arch }}.tar.gz \
+              -C pkg-rpm/SOURCES/usr/local/bin pg_gateway
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: |
+            build/pg_gateway-${{ matrix.arch }}
+            build/pg_gateway-${{ matrix.arch }}-static
+            pg_gateway-*.deb
+            pg_gateway-*.rpm
+            pg_gateway-*.tar.gz
+          retention-days: 5
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find release-artifacts -type f -exec cp {} release/ \;
+          ls -lah release/
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum * > SHA256SUMS
+          cd ..
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+          body: |
+            ## 🚀 pg_gateway ${{ github.ref_name }}
+            
+            High-performance PostgreSQL load balancer for intelligent primary routing.
+            
+            ### 📦 Installation
+            
+            **Docker:**
+            ```bash
+            docker pull ghcr.io/mesudip/pg_gateway:${{ github.ref_name }}
+            docker pull ghcr.io/mesudip/pg_gateway:latest
+            ```
+            
+            **Debian/Ubuntu:**
+            ```bash
+            wget https://github.com/mesudip/pg_gateway/releases/download/${{ github.ref_name }}/pg_gateway-${{ github.ref_name }}-amd64.deb
+            sudo dpkg -i pg_gateway-${{ github.ref_name }}-amd64.deb
+            ```
+            
+            **RHEL/CentOS:**
+            ```bash
+            wget https://github.com/mesudip/pg_gateway/releases/download/${{ github.ref_name }}/pg_gateway-${{ github.ref_name }}-amd64.rpm
+            sudo rpm -i pg_gateway-${{ github.ref_name }}-amd64.rpm
+            ```
+            
+            **Static Binary (no dependencies):**
+            ```bash
+            wget https://github.com/mesudip/pg_gateway/releases/download/${{ github.ref_name }}/pg_gateway-amd64-static
+            chmod +x pg_gateway-amd64-static
+            sudo mv pg_gateway-amd64-static /usr/local/bin/pg_gateway
+            ```
+            
+            ### 📋 Available Files
+            
+            - **Dynamic binaries** (requires libpq5): `pg_gateway-{amd64,arm64}`
+            - **Static binaries** (standalone): `pg_gateway-{amd64,arm64}-static`
+            - **Debian packages**: `pg_gateway-*-{amd64,arm64}.deb`
+            - **RPM packages**: `pg_gateway-*-{amd64,arm64}.rpm`
+            - **Checksums**: `SHA256SUMS`
+            
+            ### 🔗 Links
+            
+            - [Documentation](https://github.com/mesudip/pg_gateway)
+            - [Live Benchmarks](https://mesudip.github.io/pg_gateway/benchmark/)
+            - [Test Reports](https://mesudip.github.io/pg_gateway/tests/)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

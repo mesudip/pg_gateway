@@ -1,0 +1,106 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [ main, master ]
+  schedule:
+    # Run benchmarks weekly on Monday at 00:00 UTC
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/requirements.txt
+
+      - name: Start Patroni cluster
+        run: |
+          docker compose -f tests/docker-compose-patroni.yml up -d --build
+          echo "Waiting for cluster to be healthy..."
+          sleep 90
+
+      - name: Run benchmarks
+        run: |
+          pytest tests/src/test_benchmarks.py \
+            --benchmark-enable \
+            --benchmark-autosave \
+            --benchmark-save-data \
+            --benchmark-json=reports/benchmark.json \
+            --html=reports/benchmark_report.html \
+            --self-contained-html \
+            -v -m benchmark
+
+      - name: Generate tabular benchmark report
+        run: |
+          python scripts/generate_benchmark_report.py \
+            reports/benchmark.json \
+            reports/benchmark_table.html
+
+      - name: Stop cluster
+        if: always()
+        run: docker compose -f tests/docker-compose-patroni.yml down -v
+
+      - name: Prepare reports for pages
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        run: |
+          mkdir -p gh-pages/benchmark
+          cp reports/benchmark*.html gh-pages/benchmark/ 2>/dev/null || true
+          cp reports/benchmark.json gh-pages/benchmark/ 2>/dev/null || true
+          # Create benchmark index
+          cat > gh-pages/benchmark/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>pg_gateway Benchmarks</title>
+          <style>body{font-family:sans-serif;margin:40px;} a{display:block;padding:8px;}</style>
+          </head>
+          <body>
+          <h1>pg_gateway Benchmark Reports</h1>
+          <p>Performance comparison: gateway vs direct primary connection</p>
+          <a href="benchmark_table.html">📊 Tabular Report (ms)</a>
+          <a href="benchmark_report.html">📈 Detailed Report</a>
+          <a href="benchmark.json">📄 JSON Data</a>
+          <a href="../index.html">Back to Reports Home</a>
+          </body>
+          </html>
+          EOF
+          # Create root index if not exists
+          if [ ! -f gh-pages/index.html ]; then
+            cat > gh-pages/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>pg_gateway Reports</title>
+          <style>body{font-family:sans-serif;margin:40px;} a{display:block;padding:12px;font-size:18px;}</style>
+          </head>
+          <body>
+          <h1>pg_gateway CI Reports</h1>
+          <a href="benchmark/">📊 Benchmarks</a>
+          <a href="tests/">🧪 Tests</a>
+          </body>
+          </html>
+          EOF
+          fi
+
+      - name: Deploy to GitHub Pages (benchmarks)
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./gh-pages
+          keep_files: true
+          destination_dir: .

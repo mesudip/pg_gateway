@@ -1,0 +1,18 @@
+# Testing dependencies for pg_gateway
+pytest>=7.4.0
+pytest-html>=4.1.0
+pytest-benchmark>=4.0.0
+pytest-timeout>=2.2.0
+pytest-asyncio>=0.23.0
+
+# PostgreSQL driver
+psycopg2-binary>=2.9.9
+
+# HTTP requests for Patroni API
+requests>=2.31.0
+
+# Docker management for test fixtures
+docker>=7.0.0
+
+# Utilities
+python-dotenv>=1.0.0
