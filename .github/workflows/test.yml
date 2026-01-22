@@ -28,6 +28,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r tests/requirements.txt
 
+      - name: Clone Patroni repository
+        run: |
+          git clone https://github.com/patroni/patroni.git patroni-repo
+          echo "Patroni repo cloned"
+
+      - name: Build Patroni Docker image
+        run: |
+          docker build -t patroni ./patroni-repo
+          echo "Patroni image built"
+
       - name: Start Patroni cluster
         run: |
           docker compose -f tests/docker-compose-patroni.yml up -d --build
