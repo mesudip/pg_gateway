@@ -97,20 +97,24 @@ void send_pg_error(int fd, const char *message) {
 void close_conn(conn_t *c) {
     if (!c) return;
     
-    // Explicitly remove from epoll before closing
-    if (g_epfd >= 0) {
-        if (c->client_fd >= 0) epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->client_fd, NULL);
-        if (c->backend_fd >= 0) epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->backend_fd, NULL);
-    }
+    // Note: metrics_dec_active_connections() should be called by the caller
+    // only when the connection was fully registered (metrics_inc was called)
     
+    // Note: caller must handle epoll removal with correct epfd
     if (c->client_fd >= 0) close(c->client_fd);
     if (c->backend_fd >= 0) close(c->backend_fd);
-    if (c->c2b_pipe[0] >= 0) { close(c->c2b_pipe[0]); close(c->c2b_pipe[1]); }
-    if (c->b2c_pipe[0] >= 0) { close(c->b2c_pipe[0]); close(c->b2c_pipe[1]); }
+    
+    // Pipe FDs: -1 means not initialized
+    if (c->c2b_pipe[0] >= 0) close(c->c2b_pipe[0]);
+    if (c->c2b_pipe[1] >= 0) close(c->c2b_pipe[1]);
+    if (c->b2c_pipe[0] >= 0) close(c->b2c_pipe[0]);
+    if (c->b2c_pipe[1] >= 0) close(c->b2c_pipe[1]);
+    
     free(c);
 }
 
 // Attempts to move data from 'from_fd' -> 'to_pipe_w'
+// Returns: >0 bytes transferred, 0 for EOF, -1 for error, -2 for EAGAIN (no data available)
 static ssize_t splice_in(int from_fd, int to_pipe_w) {
     ssize_t total = 0;
     while (1) {
@@ -123,7 +127,7 @@ static ssize_t splice_in(int from_fd, int to_pipe_w) {
         total += n;
         if (n < SPLICE_CHUNK) break; // Pipe likely full or socket empty
     }
-    return total > 0 ? total : -2; // -2 indicates "no data processed but no error"
+    return total > 0 ? total : -2; // -2 indicates "no data available but no error"
 }
 
 // Attempts to move data from 'from_pipe_r' -> 'to_fd'
@@ -139,13 +143,13 @@ static int splice_out(int from_pipe_r, int to_fd) {
     return 0;
 }
 
-static int epoll_mod(int fd, uint32_t events, void *ptr) {
+int epoll_mod(int epfd, int fd, uint32_t events, void *ptr) {
     struct epoll_event ev = {.events = events, .data.ptr = ptr};
-    return epoll_ctl(g_epfd, EPOLL_CTL_MOD, fd, &ev);
+    return epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
 }
 
 // Main state machine driver for a connection
-static int drive_connection(conn_t *c) {
+int drive_connection(conn_t *c) {
     
     // 1. Handle Connection Establishment
     if (c->state == STATE_CONNECTING) {
@@ -167,6 +171,8 @@ static int drive_connection(conn_t *c) {
     ssize_t r = splice_in(c->client_fd, c->c2b_pipe[1]);
     if (r == 0) return -1; // Client EOF
     if (r == -1) return -1; // Error
+    // r == -2 means EAGAIN (no data), which is fine
+    if (r > 0) metrics_add_bytes_c2b(r);
     
     if (splice_out(c->c2b_pipe[0], c->backend_fd) < 0) return -1;
 
@@ -174,13 +180,15 @@ static int drive_connection(conn_t *c) {
     r = splice_in(c->backend_fd, c->b2c_pipe[1]);
     if (r == 0) return -1; // Backend EOF
     if (r == -1) return -1;
+    // r == -2 means EAGAIN (no data), which is fine
+    if (r > 0) metrics_add_bytes_b2c(r);
 
     if (splice_out(c->b2c_pipe[0], c->client_fd) < 0) return -1;
 
     return 0;
 }
 
-static void update_epoll_flags(conn_t *c) {
+void update_epoll_flags(conn_t *c, int epfd) {
     uint32_t ev_cli = EPOLLIN | EPOLLET | EPOLLRDHUP;
     uint32_t ev_be  = EPOLLIN | EPOLLET | EPOLLRDHUP;
 
@@ -195,6 +203,6 @@ static void update_epoll_flags(conn_t *c) {
         if (pipe_bytes_available(c->c2b_pipe[0]) > 0) ev_be |= EPOLLOUT;
     }
 
-    epoll_mod(c->client_fd, ev_cli, c);
-    epoll_mod(c->backend_fd, ev_be, c);
+    epoll_mod(epfd, c->client_fd, ev_cli, c);
+    epoll_mod(epfd, c->backend_fd, ev_be, c);
 }

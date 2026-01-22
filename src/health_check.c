@@ -46,7 +46,7 @@ void parse_candidates(const char *s) {
         
         // Pre-compute connection string
         snprintf(g_candidates[g_ncand].conninfo, sizeof(g_candidates[g_ncand].conninfo),
-                 "host=%s port=%s connect_timeout=%d dbname=%s",
+                 "host=%s port=%s connect_timeout=%d dbname=%s application_name=pg_gateway",
                  g_candidates[g_ncand].host, g_candidates[g_ncand].port, cto / 1000, dbname);
         
         g_candidates[g_ncand].health_conn = NULL;
@@ -158,7 +158,6 @@ typedef struct {
 void *health_thread_func(void *arg) {
     (void)arg;
     int check_int = getenv("CHECK_EVERY") ? atoi(getenv("CHECK_EVERY")) : 2;
-    int cto = getenv("CONNECT_TIMEOUT_MS") ? atoi(getenv("CONNECT_TIMEOUT_MS")) : 800;
     int qto = getenv("QUERY_TIMEOUT_MS") ? atoi(getenv("QUERY_TIMEOUT_MS")) : 500;
 
     health_state_t last_state = HEALTH_UNKNOWN;
@@ -178,7 +177,7 @@ void *health_thread_func(void *arg) {
         
         // Clear statuses for this iteration
         memset(statuses, 0, g_ncand * sizeof(backend_status_t));
-        size_t status_count = g_ncand
+        size_t status_count = g_ncand;
 
         // 1. Scan candidates for a primary and collect all statuses
         for (size_t i = 0; i < status_count; i++) {

@@ -51,7 +51,6 @@ typedef struct {
     target_addr_t target; // Resolved address
 } candidate_t;
 
-
 // Connection states
 typedef enum {
     STATE_CONNECTING,
@@ -71,14 +70,22 @@ typedef struct {
     conn_state_t state;
 } conn_t;
 
+// Worker thread structure
+typedef struct {
+    pthread_t tid;
+    int epfd;
+    int wakeup_pipe[2];  // Pipe to receive new connections
+    long active_connections;
+    int thread_id;
+} worker_thread_t;
+
 /* --- Globals (defined in main.c) --- */
 extern volatile sig_atomic_t g_running;
-extern int g_epfd;
 extern candidate_t *g_candidates;
 extern size_t g_ncand;
-extern target_addr_t g_current_primary;
-extern pthread_rwlock_t g_primary_lock;
+extern int g_primary_idx;  // Index into g_candidates, or -1 if none
 extern int g_epoch;
+extern worker_thread_t *g_workers;
 
 /* --- Utility Functions (main.c) --- */
 void die(const char *fmt, ...);
@@ -93,12 +100,24 @@ bool sockaddr_equal(const struct sockaddr_storage *a, socklen_t a_len,
 void parse_candidates(const char *s);
 void *health_thread_func(void *arg);
 
+/* --- Metrics Functions (metrics.c) --- */
+int metrics_start_server(const char *host, const char *port, pthread_t *thread_out);
+void metrics_inc_active_connections(void);
+void metrics_dec_active_connections(void);
+void metrics_add_bytes_c2b(ssize_t delta);
+void metrics_add_bytes_b2c(ssize_t delta);
+void metrics_set_server_counts(int total, int healthy);
+
 /* --- Gateway Functions (gateway.c) --- */
 void send_pg_error(int fd, const char *message);
 int make_pipe(int p[2]);
 int pipe_bytes_available(int rfd);
 void close_conn(conn_t *c);
 int drive_connection(conn_t *c);
-void update_epoll_flags(conn_t *c);
+void update_epoll_flags(conn_t *c, int epfd);
+int epoll_mod(int epfd, int fd, uint32_t events, void *ptr);
+
+/* --- Forwarder Functions (forwarder.c) --- */
+void *forwarder_thread_func(worker_thread_t *worker);
 
 #endif /* GATEWAY_H */

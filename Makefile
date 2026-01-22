@@ -10,8 +10,8 @@ BUILD_DIR = build
 TARGET = $(BUILD_DIR)/pg_gateway
 TARGET_STATIC = $(BUILD_DIR)/pg_gateway-static
 
-SOURCES = $(SRC_DIR)/main.c $(SRC_DIR)/gateway.c $(SRC_DIR)/health_check.c
-OBJECTS = $(BUILD_DIR)/main.o $(BUILD_DIR)/gateway.o $(BUILD_DIR)/health_check.o
+SOURCES = $(SRC_DIR)/main.c $(SRC_DIR)/gateway.c $(SRC_DIR)/health_check.c $(SRC_DIR)/metrics.c $(SRC_DIR)/forwarder.c
+OBJECTS = $(BUILD_DIR)/main.o $(BUILD_DIR)/gateway.o $(BUILD_DIR)/health_check.o $(BUILD_DIR)/metrics.o $(BUILD_DIR)/forwarder.o
 
 .PHONY: all clean install static venv test
 

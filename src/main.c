@@ -15,14 +15,13 @@
 /* --- Global Definitions --- */
 
 volatile sig_atomic_t g_running = 1;
-int g_epfd = -1;
 
 candidate_t *g_candidates = NULL;
 size_t g_ncand = 0;
 
-target_addr_t g_current_primary = {0};
-pthread_rwlock_t g_primary_lock = PTHREAD_RWLOCK_INITIALIZER;
+int g_primary_idx = -1;  // Index into g_candidates, or -1 if none
 int g_epoch = 0;
+worker_thread_t *g_workers = NULL;
 
 /* --- Logging & Utils --- */
 
@@ -91,12 +90,12 @@ bool sockaddr_equal(const struct sockaddr_storage *a, socklen_t a_len,
         const struct sockaddr_in *a4 = (const struct sockaddr_in *)a;
         const struct sockaddr_in *b4 = (const struct sockaddr_in *)b;
         return (a4->sin_port == b4->sin_port) &&
-               (a4->sin_addr.s_addr == b4->sin_addr.s_addr);
+              (a4->sin_addr.s_addr == b4->sin_addr.s_addr);
     } else if (a->ss_family == AF_INET6) {
         const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)a;
         const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
         return (a6->sin6_port == b6->sin6_port) &&
-               (memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(struct in6_addr)) == 0);
+            (memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(struct in6_addr)) == 0);
     }
     
     // Fallback for other families
@@ -129,6 +128,13 @@ int main(int argc, char **argv) {
     
     parse_candidates(getenv("CANDIDATES"));
     
+    // Parse number of worker threads
+    int g_num_workers = 1;
+    const char *num_threads_env = getenv("NUM_THREADS");
+    if (num_threads_env) g_num_workers = atoi(num_threads_env);
+    if (g_num_workers < 1) g_num_workers = 1;
+    if (g_num_workers > 64) g_num_workers = 64;
+    
     struct sigaction sa = {0};
     sa.sa_handler = hup_handler;
     sigaction(SIGINT, &sa, NULL);
@@ -138,6 +144,38 @@ int main(int argc, char **argv) {
     // Start Health Thread
     pthread_t ht;
     if (pthread_create(&ht, NULL, health_thread_func, NULL) != 0) die("pthread_create failed");
+
+    // Start Metrics Server
+    pthread_t metrics_thread;
+    const char *metrics_host = getenv("METRICS_HOST");
+    const char *metrics_port = getenv("METRICS_PORT");
+    if (!metrics_host) metrics_host = "::";
+    if (!metrics_port) metrics_port = "9090";
+    metrics_start_server(metrics_host, metrics_port, &metrics_thread);
+    
+    // Create Worker Threads
+    g_workers = calloc(g_num_workers, sizeof(worker_thread_t));
+    for (int i = 0; i < g_num_workers; i++) {
+        worker_thread_t *w = &g_workers[i];
+        w->thread_id = i;
+        w->epfd = epoll_create1(EPOLL_CLOEXEC);
+        if (w->epfd < 0) die("epoll_create1 failed for worker %d: %s", i, strerror(errno));
+        w->active_connections = 0;
+        
+        if (pipe2(w->wakeup_pipe, O_NONBLOCK | O_CLOEXEC) < 0) die("pipe2 failed");
+        
+        // Add wakeup pipe to worker epoll
+        struct epoll_event ev = {.events = EPOLLIN, .data.ptr = NULL};
+        if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->wakeup_pipe[0], &ev) < 0) {
+            die("epoll_ctl add wakeup failed for worker %d: %s", i, strerror(errno));
+        }
+        
+        if (pthread_create(&w->tid, NULL, (void *(*)(void *))forwarder_thread_func, w) != 0) {
+            die("pthread_create failed for worker %d", i);
+        }
+    }
+    
+    warnx("Started %d worker threads", g_num_workers);
 
     // Setup Listener with IPv6 support
     struct addrinfo hints = {0}, *res = NULL, *rp = NULL;
@@ -186,113 +224,121 @@ int main(int argc, char **argv) {
     if (lfd < 0) die("Failed to bind to %s:%s", listen_addr, listen_port);
     if (listen(lfd, 4096) < 0) die("listen failed");
 
-    g_epfd = epoll_create1(EPOLL_CLOEXEC);
-    struct epoll_event ev_list = {.events = EPOLLIN, .data.ptr = NULL}; // NULL ptr marks listener
-    epoll_ctl(g_epfd, EPOLL_CTL_ADD, lfd, &ev_list);
-
-    struct epoll_event *events = calloc(MAX_EVENTS, sizeof(struct epoll_event));
     warnx("LB started on %s:%s", listen_addr, listen_port);
 
+    // Accept loop: dispatch to least-loaded worker
     while (g_running) {
-        int n = epoll_wait(g_epfd, events, MAX_EVENTS, 1000);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            die("epoll_wait failed");
+        struct sockaddr_storage ss;
+        socklen_t slen = sizeof(ss);
+        int cfd = accept4(lfd, (struct sockaddr*)&ss, &slen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (cfd < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(1000);
+                continue;
+            }
+            break;
         }
-
-        // Current epoch snapshot for this batch
+        set_tcp_opts(cfd);
+        
+        // Fetch Primary
+        int primary_idx = __atomic_load_n(&g_primary_idx, __ATOMIC_RELAXED);
         int cur_epoch = __atomic_load_n(&g_epoch, __ATOMIC_RELAXED);
-
-        for (int i = 0; i < n; i++) {
-            conn_t *c = (conn_t*)events[i].data.ptr;
-
-            // 1. LISTENER EVENT
-            if (c == NULL) { 
-                while (1) {
-                    struct sockaddr_storage ss; socklen_t slen = sizeof(ss);
-                    int cfd = accept4(lfd, (struct sockaddr*)&ss, &slen, SOCK_NONBLOCK | SOCK_CLOEXEC);
-                    if (cfd < 0) break; 
-                    set_tcp_opts(cfd);
-
-                    // Fetch Primary (Non-blocking access)
-                    target_addr_t target;
-                    pthread_rwlock_rdlock(&g_primary_lock);
-                    target = g_current_primary;
-                    pthread_rwlock_unlock(&g_primary_lock);
-
-                    if (!target.valid) {
-                        // Send PostgreSQL error message instead of silent drop
-                        send_pg_error(cfd, "no healthy PostgreSQL primary available");
-                        close(cfd);
-                        continue;
-                    }
-
-                    // Connect to backend
-                    int bfd = socket(target.addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-                    if (bfd < 0) { close(cfd); continue; }
-                    set_tcp_opts(bfd);
-
-                    int rc = connect(bfd, (struct sockaddr*)&target.addr, target.addr_len);
-                    if (rc < 0 && errno != EINPROGRESS) {
-                        close(cfd); close(bfd); continue;
-                    }
-
-                    // Alloc Connection
-                    conn_t *nc = calloc(1, sizeof(conn_t));
-                    if (!nc) { close(cfd); close(bfd); continue; }
-                    
-                    nc->client_fd = cfd;
-                    nc->backend_fd = bfd;
-                    nc->epoch_bound = cur_epoch;
-                    nc->state = (rc == 0) ? STATE_ESTABLISHED : STATE_CONNECTING;
-                    
-                    if (make_pipe(nc->c2b_pipe) < 0 || make_pipe(nc->b2c_pipe) < 0) {
-                        close_conn(nc); continue;
-                    }
-
-                    // Register Epoll
-                    struct epoll_event ev = {.events = EPOLLIN | EPOLLET | EPOLLRDHUP, .data.ptr = nc};
-                    if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, cfd, &ev) < 0) { close_conn(nc); continue; }
-                    
-                    // For backend: If connecting, need EPOLLOUT. If established, EPOLLIN.
-                    uint32_t be_ev = EPOLLIN | EPOLLET | EPOLLRDHUP;
-                    if (nc->state == STATE_CONNECTING) be_ev |= EPOLLOUT;
-                    
-                    ev.events = be_ev;
-                    if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, bfd, &ev) < 0) { close_conn(nc); continue; }
-                }
-                continue;
-            }
-
-            // 2. CONNECTION EVENT
-            
-            // A. Check Epoch (Kill stale connections)
-            if (c->epoch_bound != cur_epoch) {
-                // Must purge future events for this ptr to avoid Double-Free
-                for (int j = i + 1; j < n; j++) if (events[j].data.ptr == c) events[j].data.ptr = NULL;
-                close_conn(c);
-                continue;
-            }
-
-            // B. Drive IO
-            if (drive_connection(c) < 0) {
-                // Connection died or error
-                for (int j = i + 1; j < n; j++) if (events[j].data.ptr == c) events[j].data.ptr = NULL;
-                close_conn(c);
-                continue;
-            }
-
-            // C. Re-arm Epoll flags (handle partial writes/buffers)
-            update_epoll_flags(c);
+        
+        if (primary_idx < 0 || primary_idx >= (int)g_ncand) {
+            send_pg_error(cfd, "no healthy PostgreSQL primary available");
+            close(cfd);
+            continue;
         }
+        
+        target_addr_t target = g_candidates[primary_idx].target;
+        
+        // Connect to backend
+        int bfd = socket(target.addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (bfd < 0) { close(cfd); continue; }
+        set_tcp_opts(bfd);
+        
+        int rc = connect(bfd, (struct sockaddr*)&target.addr, target.addr_len);
+        if (rc < 0 && errno != EINPROGRESS) {
+            close(cfd); close(bfd); continue;
+        }
+        
+        // Alloc Connection - initialize FDs to -1 so close_conn knows what to close
+        conn_t *nc = calloc(1, sizeof(conn_t));
+        if (!nc) { close(cfd); close(bfd); continue; }
+        
+        nc->client_fd = cfd;
+        nc->backend_fd = bfd;
+        nc->c2b_pipe[0] = nc->c2b_pipe[1] = -1;  // Mark as uninitialized
+        nc->b2c_pipe[0] = nc->b2c_pipe[1] = -1;  // Mark as uninitialized
+        nc->epoch_bound = cur_epoch;
+        nc->state = (rc == 0) ? STATE_ESTABLISHED : STATE_CONNECTING;
+        
+        if (make_pipe(nc->c2b_pipe) < 0 || make_pipe(nc->b2c_pipe) < 0) {
+            close_conn(nc); continue;
+        }
+        
+        // Find least-loaded worker
+        int target_worker_index = 0;
+        long best_load = __atomic_load_n(&g_workers[0].active_connections, __ATOMIC_RELAXED);
+        for (int i = 1; i < g_num_workers; i++) {
+            long load = __atomic_load_n(&g_workers[i].active_connections, __ATOMIC_RELAXED);
+            if (load < best_load) {
+                best_load = load;
+                target_worker_index = i;
+            }
+        }
+
+        worker_thread_t *target_worker = &g_workers[target_worker_index];
+        
+        // Register both FDs in worker's epoll with same connection pointer
+        // drive_connection handles both directions so we don't need to distinguish
+        struct epoll_event ev = {.events = EPOLLIN | EPOLLET | EPOLLRDHUP, .data.ptr = nc};
+        if (epoll_ctl(target_worker->epfd, EPOLL_CTL_ADD, cfd, &ev) < 0) {
+            close_conn(nc);
+            continue;
+        }
+        
+        uint32_t be_ev = EPOLLIN | EPOLLET | EPOLLRDHUP;
+        if (nc->state == STATE_CONNECTING) be_ev |= EPOLLOUT;
+        ev.events = be_ev;
+        ev.data.ptr = nc;
+        if (epoll_ctl(target_worker->epfd, EPOLL_CTL_ADD, bfd, &ev) < 0) {
+            epoll_ctl(target_worker->epfd, EPOLL_CTL_DEL, cfd, NULL);
+            close_conn(nc);
+            continue;
+        }
+        
+        __atomic_fetch_add(&target_worker->active_connections, 1, __ATOMIC_RELAXED);
+        metrics_inc_active_connections();
+        
+        // Wake up worker
+        char wake = 1;
+        write(target_worker->wakeup_pipe[1], &wake, 1);
     }
 
     warnx("Shutting down...");
     close(lfd);
-    pthread_cancel(ht);
+    
+    // Gracefully stop workers by setting g_running = 0 and waiting for them to exit
+    g_running = 0;
+    
+    // Give workers time to exit gracefully
+    for (int i = 0; i < g_num_workers; i++) {
+        // Wake up each worker so it doesn't block on epoll_wait
+        char wake = 1;
+        write(g_workers[i].wakeup_pipe[1], &wake, 1);
+    }
+    
+    // Join worker threads
+    for (int i = 0; i < g_num_workers; i++) {
+        pthread_join(g_workers[i].tid, NULL);
+        close(g_workers[i].epfd);
+        close(g_workers[i].wakeup_pipe[0]);
+        close(g_workers[i].wakeup_pipe[1]);
+    }
+    free(g_workers);
+    
     pthread_join(ht, NULL);
-    close(g_epfd);
-    free(events);
     free(g_candidates);
     return 0;
 }
