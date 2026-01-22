@@ -155,8 +155,14 @@ services:
       - PGUSER=postgres
       - PGPASSWORD=postgres
       - PGDATABASE=postgres
+      - LISTEN_HOST=0.0.0.0
+      - LISTEN_PORT=6432
+      - METRICS_HOST=0.0.0.0
+      - METRICS_PORT=9090
+      - NUM_THREADS=4
     ports:
       - "6432:6432"
+      - "9090:9090"
     networks:
       - pg_network
     depends_on:

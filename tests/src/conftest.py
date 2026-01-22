@@ -15,11 +15,13 @@ import pytest
 import psycopg2
 import requests
 import docker
+from pathlib import Path
 from contextlib import contextmanager
 from typing import Generator, Optional
 
 # Configuration
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPORTS_DIR = os.path.join(PROJECT_ROOT, "reports")
 TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COMPOSE_FILE = os.path.join(TESTS_DIR, "docker-compose-patroni.yml")
 PATRONI_REPO_URL = "https://github.com/patroni/patroni.git"
@@ -134,8 +136,28 @@ class PatroniCluster:
             return False
 
     def stop(self):
-        """Stop the Docker Compose stack."""
+        """Stop the Docker Compose stack and save gateway logs."""
         if self._compose_started:
+            # Save gateway logs before stopping
+            try:
+                Path(REPORTS_DIR).mkdir(parents=True, exist_ok=True)
+                log_file = os.path.join(REPORTS_DIR, "gateway.log")
+                result = subprocess.run(
+                    ["docker", "logs", "pg_gateway"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                with open(log_file, "w") as f:
+                    f.write(result.stdout)
+                    if result.stderr:
+                        f.write("\n=== STDERR ===\n")
+                        f.write(result.stderr)
+                print(f"[INFO] Gateway logs saved to {log_file}")
+            except Exception as e:
+                print(f"[WARN] Failed to save gateway logs: {e}")
+            
+            # Stop the compose stack
             subprocess.run(
                 ["docker", "compose", "-f", COMPOSE_FILE, "down", "-v"],
                 capture_output=True,

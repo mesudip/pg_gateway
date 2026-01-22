@@ -33,57 +33,111 @@ class TestFailoverDetection:
 
     @pytest.mark.slow
     def test_connection_after_failover(self, gateway_connection_params, patroni_cluster):
-        """Test that new connections work after a failover."""
-        # Get initial primary
+        """Test that connections work before and after a failover.
+        
+        Steps:
+        1. Make connections and verify they work (pre-failover)
+        2. Perform failover
+        3. Confirm new primary via Patroni API
+        4. Make connections and verify they work (post-failover)
+        """
+        # Step 1: Verify connections work before failover
+        print("\n[Step 1] Testing connections before failover...")
+        pre_failover_success = 0
+        for i in range(5):
+            try:
+                conn = psycopg2.connect(**gateway_connection_params, connect_timeout=5)
+                conn.autocommit = True
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1")
+                result = cursor.fetchone()[0]
+                assert result == 1, "Pre-failover query should return 1"
+                cursor.execute("SELECT pg_is_in_recovery()")
+                is_replica = cursor.fetchone()[0]
+                assert is_replica is False, "Should be connected to primary"
+                cursor.close()
+                conn.close()
+                pre_failover_success += 1
+            except Exception as e:
+                print(f"  Pre-failover connection {i} failed: {e}")
+        
+        assert pre_failover_success >= 4, f"At least 4/5 pre-failover connections should work, got {pre_failover_success}"
+        print(f"  ✓ Pre-failover: {pre_failover_success}/5 connections successful")
+        
+        # Get initial primary info
         initial_primary = patroni_cluster.get_primary_info()
-        assert initial_primary is not None
+        assert initial_primary is not None, "Should have initial primary"
         initial_primary_name = initial_primary["name"]
+        print(f"  Initial primary: {initial_primary_name}")
 
-        # Trigger failover
-        print(f"\nTriggering failover from {initial_primary_name}...")
+        # Step 2: Trigger failover
+        print(f"\n[Step 2] Triggering failover from {initial_primary_name}...")
         success = patroni_cluster.trigger_failover()
         
         if not success:
             pytest.skip("Could not trigger failover - may require manual intervention")
 
-        # Wait for failover to complete
-        print("Waiting for failover to complete...")
+        print("  Waiting for failover to complete (15s)...")
         time.sleep(15)
 
-        # Wait for new primary
+        # Step 3: Confirm new primary via Patroni API
+        print("\n[Step 3] Confirming new primary via Patroni API...")
         max_wait = 30
         new_primary = None
-        for _ in range(max_wait // 2):
+        for attempt in range(max_wait // 2):
             new_primary = patroni_cluster.get_primary_info()
             if new_primary and new_primary["name"] != initial_primary_name:
+                print(f"  ✓ New primary detected: {new_primary['name']}")
                 break
             time.sleep(2)
+            print(f"  Waiting for new primary... (attempt {attempt + 1})")
 
         assert new_primary is not None, "Should have a new primary after failover"
-        assert new_primary["name"] != initial_primary_name, "Primary should have changed"
+        assert new_primary["name"] != initial_primary_name, f"Primary should have changed from {initial_primary_name}"
+        print(f"  ✓ Failover complete: {initial_primary_name} -> {new_primary['name']}")
 
-        # Test connection through gateway
+        # Step 4: Verify connections work after failover
+        print("\n[Step 4] Testing connections after failover...")
+        post_failover_success = 0
         max_retry = 10
-        conn = None
-        for attempt in range(max_retry):
-            try:
-                conn = psycopg2.connect(**gateway_connection_params)
-                conn.autocommit = True
-                cursor = conn.cursor()
-                cursor.execute("SELECT pg_is_in_recovery()")
-                is_replica = cursor.fetchone()[0]
-                cursor.close()
-                
-                if not is_replica:
+        
+        for i in range(5):
+            conn = None
+            for attempt in range(max_retry):
+                try:
+                    conn = psycopg2.connect(**gateway_connection_params, connect_timeout=5)
+                    conn.autocommit = True
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT 1")
+                    result = cursor.fetchone()[0]
+                    assert result == 1, "Post-failover query should return 1"
+                    cursor.execute("SELECT pg_is_in_recovery()")
+                    is_replica = cursor.fetchone()[0]
+                    cursor.close()
+                    
+                    if not is_replica:
+                        conn.close()
+                        post_failover_success += 1
+                        break
+                    conn.close()
+                    conn = None
+                except psycopg2.OperationalError as e:
+                    if conn and not conn.closed:
+                        conn.close()
+                    if attempt < max_retry - 1:
+                        time.sleep(2)
+                    else:
+                        print(f"  Post-failover connection {i} failed after {max_retry} attempts: {e}")
+                except Exception as e:
+                    if conn and not conn.closed:
+                        conn.close()
+                    print(f"  Post-failover connection {i} error: {e}")
                     break
-                conn.close()
-                conn = None
-            except psycopg2.OperationalError:
-                pass
-            time.sleep(2)
 
-        assert conn is not None, "Should be able to connect after failover"
-        conn.close()
+        assert post_failover_success >= 3, f"At least 3/5 post-failover connections should work, got {post_failover_success}"
+        print(f"  ✓ Post-failover: {post_failover_success}/5 connections successful")
+        print(f"\n[Summary] Failover test complete: {pre_failover_success}/5 before, {post_failover_success}/5 after")
+
 
 @pytest.mark.failover  
 class TestPatroniAPIIntegration:
