@@ -40,19 +40,14 @@ ENV CANDIDATES=""
 ENV PGUSER="postgres"
 ENV PGPASSWORD=""
 ENV PGDATABASE="postgres"
-ENV LISTEN_HOST="0.0.0.0"
-ENV LISTEN_PORT="6432"
+ENV LISTEN_HOST="::"
+ENV LISTEN_PORT="5432"
 
 # Run as non-root user
 USER pggateway
 
 # Expose the gateway port
-EXPOSE 6432
+EXPOSE 5432
 
-# Health check
-HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD nc -z localhost 6432 || exit 1
-
-# Start the load balancer
+# Start the load balancer (reads LISTEN_HOST and LISTEN_PORT from env)
 ENTRYPOINT ["/usr/local/bin/pg_gateway"]
-CMD ["0.0.0.0", "6432"]

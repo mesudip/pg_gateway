@@ -110,7 +110,22 @@ static void hup_handler(int sig) { (void)sig; g_running = 0; }
 /* --- Main --- */
 
 int main(int argc, char **argv) {
-    if (argc != 3) die("Usage: %s <listen_addr> <listen_port>", argv[0]);
+    const char *listen_addr;
+    const char *listen_port;
+    
+    if (argc >= 3) {
+        listen_addr = argv[1];
+        listen_port = argv[2];
+    } else if (argc == 1) {
+        // Read from environment variables
+        listen_addr = getenv("LISTEN_HOST");
+        listen_port = getenv("LISTEN_PORT");
+        if (!listen_addr) listen_addr = "localhost";
+        if (!listen_port) listen_port = "5432";
+    } else {
+        die("Usage: %s [<listen_addr> <listen_port>]\n"
+            "       Or set LISTEN_HOST and LISTEN_PORT environment variables", argv[0]);
+    }
     
     parse_candidates(getenv("CANDIDATES"));
     
@@ -130,8 +145,15 @@ int main(int argc, char **argv) {
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;     // For wildcard IP address
     
-    if (getaddrinfo(argv[1], argv[2], &hints, &res) != 0) {
-        die("getaddrinfo failed for %s:%s", argv[1], argv[2]);
+    int gai = getaddrinfo(listen_addr, listen_port, &hints, &res);
+    if (gai != 0 && strcmp(listen_addr, "::") == 0) {
+        // Fallback when IPv6 is disabled: try IPv4 wildcard
+        warnx("IPv6 unavailable; falling back to 0.0.0.0:%s", listen_port);
+        listen_addr = "0.0.0.0";
+        gai = getaddrinfo(listen_addr, listen_port, &hints, &res);
+    }
+    if (gai != 0) {
+        die("getaddrinfo failed for %s:%s", listen_addr, listen_port);
     }
     
     int lfd = -1;
@@ -161,7 +183,7 @@ int main(int argc, char **argv) {
     
     freeaddrinfo(res);
     
-    if (lfd < 0) die("Failed to bind to %s:%s", argv[1], argv[2]);
+    if (lfd < 0) die("Failed to bind to %s:%s", listen_addr, listen_port);
     if (listen(lfd, 4096) < 0) die("listen failed");
 
     g_epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -169,7 +191,7 @@ int main(int argc, char **argv) {
     epoll_ctl(g_epfd, EPOLL_CTL_ADD, lfd, &ev_list);
 
     struct epoll_event *events = calloc(MAX_EVENTS, sizeof(struct epoll_event));
-    warnx("LB started on %s:%s", argv[1], argv[2]);
+    warnx("LB started on %s:%s", listen_addr, listen_port);
 
     while (g_running) {
         int n = epoll_wait(g_epfd, events, MAX_EVENTS, 1000);
