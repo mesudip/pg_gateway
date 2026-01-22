@@ -38,11 +38,8 @@ jobs:
           docker build -t patroni ./patroni-repo
           echo "Patroni image built"
 
-      - name: Start Patroni cluster
-        run: |
-          docker compose -f tests/docker-compose-patroni.yml up -d --build
-          echo "Waiting for cluster to be healthy..."
-          sleep 90
+      - name: Create reports directory
+        run: mkdir -p reports
 
       - name: Run connection tests
         run: |
@@ -65,9 +62,11 @@ jobs:
             --self-contained-html \
             -v
 
-      - name: Stop cluster
+      - name: Cleanup Docker resources
         if: always()
-        run: docker compose -f tests/docker-compose-patroni.yml down -v
+        run: |
+          docker compose -f tests/docker-compose-patroni.yml down -v || true
+          docker system prune -f || true
 
       - name: Prepare reports for pages
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
