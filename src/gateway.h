@@ -46,7 +46,11 @@ typedef struct {
 typedef struct {
     char host[256];
     char port[16];
+    char conninfo[1024];  // Pre-computed connection string
+    PGconn *health_conn;  // Persistent connection for health checks
+    target_addr_t target; // Resolved address
 } candidate_t;
+
 
 // Connection states
 typedef enum {
