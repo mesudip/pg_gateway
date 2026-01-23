@@ -27,6 +27,18 @@
 #include <unistd.h>
 #include <libpq-fe.h>
 
+/* --- Debug Logging --- */
+#define DEBUG_ENABLED 0
+
+#define DEBUG_LOG(fmt, ...) do { \
+    if (DEBUG_ENABLED) { \
+        struct timespec ts; \
+        clock_gettime(CLOCK_REALTIME, &ts); \
+        fprintf(stderr, "[%ld.%03ld] [DEBUG] " fmt "\n", \
+                ts.tv_sec, ts.tv_nsec/1000000, ##__VA_ARGS__); \
+    } \
+} while(0)
+
 /* --- Tunables --- */
 #define MAX_EVENTS      4096
 #define SPLICE_CHUNK    (128 * 1024)     // 128 KiB per splice call
@@ -62,6 +74,8 @@ typedef struct {
     int client_fd;
     int backend_fd;
     int epoch_bound;
+    int closed;          // 0 = open, 1 = closed (guards double-free)
+    int registered;      // 1 after accept thread increments worker/metrics
     
     // Pipes
     int c2b_pipe[2]; // Client -> Backend (Write to [1], Read from [0])
@@ -112,8 +126,8 @@ void metrics_set_server_counts(int total, int healthy);
 void send_pg_error(int fd, const char *message);
 int make_pipe(int p[2]);
 int pipe_bytes_available(int rfd);
-void close_conn(conn_t *c);
-int drive_connection(conn_t *c);
+int close_conn(conn_t *c); // returns 1 if closed now, 0 if already closed
+int drive_connection(conn_t *c); // 0=ok, -1=client_closed, -2=backend_closed, -3=error
 void update_epoll_flags(conn_t *c, int epfd);
 int epoll_mod(int epfd, int fd, uint32_t events, void *ptr);
 

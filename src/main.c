@@ -244,6 +244,8 @@ int main(int argc, char **argv) {
         int primary_idx = __atomic_load_n(&g_primary_idx, __ATOMIC_RELAXED);
         int cur_epoch = __atomic_load_n(&g_epoch, __ATOMIC_RELAXED);
         
+        DEBUG_LOG("Accept: primary_idx=%d epoch=%d", primary_idx, cur_epoch);
+        
         if (primary_idx < 0 || primary_idx >= (int)g_ncand) {
             send_pg_error(cfd, "no healthy PostgreSQL primary available");
             close(cfd);
@@ -266,8 +268,12 @@ int main(int argc, char **argv) {
         conn_t *nc = calloc(1, sizeof(conn_t));
         if (!nc) { close(cfd); close(bfd); continue; }
         
+        DEBUG_LOG("New connection: conn=%p client_fd=%d backend_fd=%d epoch=%d", nc, cfd, bfd, cur_epoch);
+        
         nc->client_fd = cfd;
         nc->backend_fd = bfd;
+        nc->closed = 0;
+        nc->registered = 0;
         nc->c2b_pipe[0] = nc->c2b_pipe[1] = -1;  // Mark as uninitialized
         nc->b2c_pipe[0] = nc->b2c_pipe[1] = -1;  // Mark as uninitialized
         nc->epoch_bound = cur_epoch;
@@ -308,8 +314,11 @@ int main(int argc, char **argv) {
             continue;
         }
         
-        __atomic_fetch_add(&target_worker->active_connections, 1, __ATOMIC_RELAXED);
+        long new_count = __atomic_fetch_add(&target_worker->active_connections, 1, __ATOMIC_RELAXED) + 1;
         metrics_inc_active_connections();
+        nc->registered = 1;
+        
+        DEBUG_LOG("Assigned conn=%p to worker-%d (old_load=%ld new_count=%ld)", nc, target_worker_index, best_load, new_count);
         
         // Wake up worker
         char wake = 1;

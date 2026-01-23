@@ -50,25 +50,52 @@ void *forwarder_thread_func(worker_thread_t *worker) {
             
             // Check Epoch (Kill stale connections)
             if (c->epoch_bound != cur_epoch) {
+                DEBUG_LOG("[worker-%d] Epoch mismatch: conn=%p bound_epoch=%d cur_epoch=%d", 
+                          worker->thread_id, c, c->epoch_bound, cur_epoch);
                 // Invalidate any remaining events for this connection to prevent UAF
                 invalidate_pending_events(events, i + 1, n, c);
                 epoll_ctl(worker->epfd, EPOLL_CTL_DEL, c->client_fd, NULL);
                 epoll_ctl(worker->epfd, EPOLL_CTL_DEL, c->backend_fd, NULL);
-                close_conn(c);
-                metrics_dec_active_connections();
-                __atomic_fetch_sub(&worker->active_connections, 1, __ATOMIC_RELAXED);
+                if (close_conn(c)) {
+                    if (c->registered) {
+                        metrics_dec_active_connections();
+                        long new_count = __atomic_fetch_sub(&worker->active_connections, 1, __ATOMIC_RELAXED) - 1;
+                        DEBUG_LOG("[worker-%d] Decremented active_connections to %ld (epoch cleanup)", worker->thread_id, new_count);
+                    } else {
+                        DEBUG_LOG("[worker-%d] Skipped counter decrement (not registered) epoch cleanup conn=%p", worker->thread_id, c);
+                    }
+                } else {
+                    DEBUG_LOG("[worker-%d] close_conn skipped (already closed) in epoch cleanup for conn=%p", worker->thread_id, c);
+                }
                 continue;
             }
             
             // Drive IO
-            if (drive_connection(c) < 0) {
+            int drive_result = drive_connection(c);
+            if (drive_result < 0) {
+                if (drive_result == -2) {
+                    warnx("[worker-%d] Backend closed connection unexpectedly: conn=%p", worker->thread_id, c);
+                } else if (drive_result == -1) {
+                    DEBUG_LOG("[worker-%d] Client closed connection: conn=%p", worker->thread_id, c);
+                } else if (drive_result == -3) {
+                    DEBUG_LOG("[worker-%d] I/O error: conn=%p", worker->thread_id, c);
+                }
+                
                 // Invalidate any remaining events for this connection to prevent UAF
                 invalidate_pending_events(events, i + 1, n, c);
                 epoll_ctl(worker->epfd, EPOLL_CTL_DEL, c->client_fd, NULL);
                 epoll_ctl(worker->epfd, EPOLL_CTL_DEL, c->backend_fd, NULL);
-                close_conn(c);
-                metrics_dec_active_connections();
-                __atomic_fetch_sub(&worker->active_connections, 1, __ATOMIC_RELAXED);
+                if (close_conn(c)) {
+                    if (c->registered) {
+                        metrics_dec_active_connections();
+                        long new_count = __atomic_fetch_sub(&worker->active_connections, 1, __ATOMIC_RELAXED) - 1;
+                        DEBUG_LOG("[worker-%d] Decremented active_connections to %ld (connection closed)", worker->thread_id, new_count);
+                    } else {
+                        DEBUG_LOG("[worker-%d] Skipped counter decrement (not registered) conn=%p", worker->thread_id, c);
+                    }
+                } else {
+                    DEBUG_LOG("[worker-%d] close_conn skipped (already closed) for conn=%p", worker->thread_id, c);
+                }
                 continue;
             }
             

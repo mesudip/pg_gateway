@@ -6,6 +6,19 @@
 
 /* --- Health State --- */
 
+#ifndef DEBUG_HEALTH
+#define DEBUG_HEALTH 0
+#endif
+
+#define HLOG(fmt, ...) do { \
+    if (DEBUG_HEALTH) { \
+        struct timespec ts; \
+        clock_gettime(CLOCK_REALTIME, &ts); \
+        fprintf(stderr, "[%ld.%03ld] [DEBUG] [health] " fmt "\n", \
+                ts.tv_sec, ts.tv_nsec/1000000, ##__VA_ARGS__); \
+    } \
+} while(0)
+
 typedef enum {
     HEALTH_UNKNOWN = 0,
     HEALTH_HEALTHY,
@@ -171,6 +184,7 @@ void *health_thread_func(void *arg) {
     }
 
     while (g_running) {
+        HLOG("Starting health check cycle");
         candidate_t found_cand = {0};
         bool ok = false;
         char errbuf[256] = {0};
@@ -181,6 +195,7 @@ void *health_thread_func(void *arg) {
 
         // 1. Scan candidates for a primary and collect all statuses
         for (size_t i = 0; i < status_count; i++) {
+            HLOG("Checking candidate[%zu]: %s:%s", i, g_candidates[i].host, g_candidates[i].port);
             statuses[i].host = g_candidates[i].host;
             statuses[i].port = g_candidates[i].port;
             
@@ -242,16 +257,20 @@ void *health_thread_func(void *arg) {
             
             int cur_idx = __atomic_load_n(&g_primary_idx, __ATOMIC_RELAXED);
             if (new_idx != cur_idx) {
+                HLOG("Primary changed: old_idx=%d new_idx=%d", cur_idx, new_idx);
                 __atomic_store_n(&g_primary_idx, new_idx, __ATOMIC_RELEASE);
-                __atomic_fetch_add(&g_epoch, 1, __ATOMIC_RELAXED);
+                int new_epoch = __atomic_fetch_add(&g_epoch, 1, __ATOMIC_RELAXED) + 1;
+                HLOG("Epoch incremented to %d", new_epoch);
                 changed = true;
             }
         } else {
             // Lost primary
             int cur_idx = __atomic_load_n(&g_primary_idx, __ATOMIC_RELAXED);
             if (cur_idx >= 0) {
+                HLOG("Lost primary: old_idx=%d", cur_idx);
                 __atomic_store_n(&g_primary_idx, -1, __ATOMIC_RELEASE);
-                __atomic_fetch_add(&g_epoch, 1, __ATOMIC_RELAXED);
+                int new_epoch = __atomic_fetch_add(&g_epoch, 1, __ATOMIC_RELAXED) + 1;
+                HLOG("Epoch incremented to %d", new_epoch);
                 changed = true;
             }
         }
@@ -290,6 +309,7 @@ void *health_thread_func(void *arg) {
             }
         }
 
+        HLOG("Health check cycle complete, sleeping %ds", check_int);
         sleep(check_int);
     }
     

@@ -94,8 +94,14 @@ void send_pg_error(int fd, const char *message) {
 
 /* --- Connection Logic --- */
 
-void close_conn(conn_t *c) {
-    if (!c) return;
+int close_conn(conn_t *c) {
+    if (!c) return 0;
+
+    int was_closed = __atomic_exchange_n(&c->closed, 1, __ATOMIC_ACQ_REL);
+    if (was_closed) return 0;
+    
+    DEBUG_LOG("Closing conn=%p client_fd=%d backend_fd=%d epoch=%d", 
+              c, c->client_fd, c->backend_fd, c->epoch_bound);
     
     // Note: metrics_dec_active_connections() should be called by the caller
     // only when the connection was fully registered (metrics_inc was called)
@@ -109,8 +115,13 @@ void close_conn(conn_t *c) {
     if (c->c2b_pipe[1] >= 0) close(c->c2b_pipe[1]);
     if (c->b2c_pipe[0] >= 0) close(c->b2c_pipe[0]);
     if (c->b2c_pipe[1] >= 0) close(c->b2c_pipe[1]);
-    
-    free(c);
+    // Do not free here to avoid UAF from stray epoll events; leak accepted for stability
+    c->client_fd = -1;
+    c->backend_fd = -1;
+    c->c2b_pipe[0] = c->c2b_pipe[1] = -1;
+    c->b2c_pipe[0] = c->b2c_pipe[1] = -1;
+    DEBUG_LOG("Conn closed (not freed) conn=%p", c);
+    return 1;
 }
 
 // Attempts to move data from 'from_fd' -> 'to_pipe_w'
@@ -150,14 +161,31 @@ int epoll_mod(int epfd, int fd, uint32_t events, void *ptr) {
 
 // Main state machine driver for a connection
 int drive_connection(conn_t *c) {
+    DEBUG_LOG("drive_connection: conn=%p state=%d client_fd=%d backend_fd=%d", 
+              c, c->state, c->client_fd, c->backend_fd);
+
+    if (__atomic_load_n(&c->closed, __ATOMIC_RELAXED)) {
+        DEBUG_LOG("drive_connection: conn=%p already closed, skipping", c);
+        return -1;
+    }
     
     // 1. Handle Connection Establishment
     if (c->state == STATE_CONNECTING) {
         int err = 0; 
         socklen_t len = sizeof(err);
-        if (getsockopt(c->backend_fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+        if (getsockopt(c->backend_fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
+            DEBUG_LOG("drive_connection: conn=%p getsockopt failed: %s", c, strerror(errno));
+            return -1;
+        }
+        if (err == EINPROGRESS || err == EALREADY) {
+            // Connect still in progress; wait for EPOLLOUT
+            return 0;
+        }
+        if (err != 0) {
+            DEBUG_LOG("drive_connection: conn=%p connect failed: %s", c, strerror(err));
             return -1; // Connect failed
         }
+        DEBUG_LOG("drive_connection: conn=%p established", c);
         c->state = STATE_ESTABLISHED;
         // Fall through to process data immediately
     }
@@ -169,21 +197,21 @@ int drive_connection(conn_t *c) {
     // Only write to backend if we have data in pipe
     
     ssize_t r = splice_in(c->client_fd, c->c2b_pipe[1]);
-    if (r == 0) return -1; // Client EOF
-    if (r == -1) return -1; // Error
+    if (r == 0) return -1; // Client EOF (normal close)
+    if (r == -1) return -3; // Error
     // r == -2 means EAGAIN (no data), which is fine
     if (r > 0) metrics_add_bytes_c2b(r);
     
-    if (splice_out(c->c2b_pipe[0], c->backend_fd) < 0) return -1;
+    if (splice_out(c->c2b_pipe[0], c->backend_fd) < 0) return -3;
 
     // B. Backend -> Client
     r = splice_in(c->backend_fd, c->b2c_pipe[1]);
-    if (r == 0) return -1; // Backend EOF
-    if (r == -1) return -1;
+    if (r == 0) return -2; // Backend EOF (unexpected)
+    if (r == -1) return -3;
     // r == -2 means EAGAIN (no data), which is fine
     if (r > 0) metrics_add_bytes_b2c(r);
 
-    if (splice_out(c->b2c_pipe[0], c->client_fd) < 0) return -1;
+    if (splice_out(c->b2c_pipe[0], c->client_fd) < 0) return -3;
 
     return 0;
 }

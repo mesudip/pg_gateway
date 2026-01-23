@@ -11,10 +11,8 @@ PGPOOL_PORT = 6432
 DB_NAME = 'test'
 DB_USER = 'postgres'
 DB_PASSWORD = 'postgres'
-NUM_REQUESTS = 50   # total requests per thread, performed one by one.
-CONCURRENT_TESTS = 50  # number of concurrent threads
-
-
+NUM_REQUESTS = 2000   # total requests per thread, performed one by one.
+CONCURRENT_TESTS = 45  # number of concurrent threads
 
 
 # Shared data
