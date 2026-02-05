@@ -236,6 +236,15 @@ void *health_thread_func(void *arg) {
                 }
             }
         }
+        
+        // Count healthy servers and update metrics
+        int healthy_count = 0;
+        for (size_t i = 0; i < status_count; i++) {
+            if (statuses[i].status != STATUS_UNHEALTHY) {
+                healthy_count++;
+            }
+        }
+        metrics_set_server_counts((int)status_count, healthy_count);
 
         // 2. Resolve DNS (off the main loop)
         target_addr_t new_target = {0};
