@@ -2,88 +2,108 @@
 
 **High-performance PostgreSQL load balancer for intelligent primary routing**
 
-`pg_gateway` is a lightweight TCP proxy that automatically routes connections to the current PostgreSQL primary in a replicated cluster. Built in C with zero-copy forwarding, it adds minimal latency while ensuring your applications always connect to the write-capable node.
+`pg_gateway` is a lightweight TCP proxy that automatically routes connections to the current PostgreSQL primary in a replicated cluster. Built in C with zero-copy forwarding (using `splice` and `epoll` on Linux), it adds minimal latency while ensuring your applications always connect to the write-capable node.
 
+> **Note**: This project relies on Linux-specific features (`epoll`, `splice`). For macOS/Windows users, please run via Docker.
+> ** Warning**: This Project is still in initial phase, and not yet ready for production
 ---
-
 
 ## Quick Start
 
-### Pull from GitHub Container Registry
+### Using Docker
+
+**Pull from GitHub Container Registry:**
 ```bash
 docker pull ghcr.io/mesudip/pg_gateway:latest
 ```
 
-### Run
+**Run with minimal configuration:**
 ```bash
 docker run -d \
-  -p 6432:6432 \
-  -e CANDIDATES="pg1:5432,pg2:5432,pg3:5432" \
-  ghcr.io/mesudip/pg_gateway:latest 0.0.0.0 6432
+  --net=host \
+  -e CANDIDATES="10.0.0.10:5432,10.0.0.11:5432" \
+  -e PGUSER=postgres \ # used for healthcheck 
+  -e PGPASSWORD=secret \
+  -e LISTEN_HOST=0.0.0.0 \
+  -e LISTEN_PORT=6432 \
+  ghcr.io/mesudip/pg_gateway:latest
 ```
-
-Connect your application to `localhost:6432` and let `pg_gateway` handle primary routing automatically.
+*(Note: `--net=host` is recommended for performance, but port mapping `-p 6432:6432` works too)*
 
 ---
 
 ## Configuration
 
-| Environment Variable | Description | Example |
-|---------------------|-------------|---------|
-| `CANDIDATES` | Comma-separated PostgreSQL hosts:ports | `pg1:5432,pg2:5432,pg3:5432` |
+Configuration is controlled via environment variables.
 
-**Command Arguments:**
-- `<listen_addr>` – Address to bind (default: `0.0.0.0`)
-- `<listen_port>` – Port to listen on (default: `6432`)
+### Core Routing
 
----
-## Why pg_gateway?
+| Variable | Description | Default | Example |
+|----------|-------------|---------|---------|
+| `CANDIDATES` | **Required.** Comma-separated list of backend PostgreSQL addresses. | - | `pg1:5432,pg2:5432` |
+| `LISTEN_HOST` | Interface address to bind the load balancer to. | `localhost` | `0.0.0.0` |
+| `LISTEN_PORT` | Port to accept client connections on. | `5432` | `6432` |
 
-🚀 **Fast** – Built with `epoll` and `splice` for zero-copy TCP proxying  
-🎯 **Smart** – Automatically detects and routes to the current primary  
-🐳 **Cloud-Native** – Runs as a sidecar or standalone container  
-📊 **Battle-Tested** – Comprehensive test suite with failover scenarios  
-🔄 **HA-Ready** – Works seamlessly with Patroni, Stolon, and other HA solutions  
+### Health Checks
 
-### Performance
+The gateway continuously polls candidates to find the primary. It uses standard `libpq` environment variables for authentication.
 
-Independent benchmarks show `pg_gateway` adds **30-70μs** overhead compared to direct connections—negligible for real-world workloads while providing automatic failover handling.
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PGUSER` | Username for health check connections. | - |
+| `PGPASSWORD` | Password for health check connections. | - |
+| `PGDATABASE` | Database name to connect to. | `postgres` |
+| `CONNECT_TIMEOUT_MS` | Timeout for health check probes (milliseconds). | `800` |
 
-[📊 View Live Benchmarks](https://mesudip.github.io/pg_gateway/benchmark/)
+### Performance & Internals
 
----
-## Use Cases
-
-- **Kubernetes/Cloud** – Deploy as a sidecar to abstract primary routing from applications
-- **Microservices** – Single connection string for all services, automatic failover handling  
-- **CI/CD** – Simplified configuration with dynamic primary detection
-- **Legacy Apps** – Add HA capabilities without application changes
-
----
-
-## How It Works
-
-1. Periodically probes candidate PostgreSQL nodes using `libpq`
-2. Identifies the current primary via `pg_is_in_recovery()`
-3. Routes all incoming connections to the primary
-4. Sends PostgreSQL error packets if no primary is available
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `NUM_THREADS` | Number of worker threads for connection handling. | `1` |
+| `TCP_KEEPALIVE` | Enable TCP keepalives (1=On, 0=Off). | `1` (On) |
+| `METRICS_HOST` | Host to bind the Prometheus metrics server. | `::` |
+| `METRICS_PORT` | Port for Prometheus metrics. | `9090` |
 
 ---
 
-## Documentation
+## Features
 
-- [Developer Guide](DEVELOPER.md) – Build from source, run tests, contribute
-- [Test Reports](https://mesudip.github.io/pg_gateway/tests/) – CI test results
-- [Benchmarks](https://mesudip.github.io/pg_gateway/benchmark/) – Performance metrics
+*   **Zero-Copy Forwarding**: Leverages Linux `splice()` to move data between sockets without copying to user-space, maximizing throughput and minimizing CPU usage.
+*   **Event-Driven**: Uses `epoll` for efficient, non-blocking I/O handling of thousands of concurrent connections.
+*   **Multi-Threaded**: Distributes client connections across multiple worker threads (configurable via `NUM_THREADS`).
+*   **Smart Routing**: Automatically detects the new primary during failovers and updates routing tables instantly.
+*   **Observability**: Built-in Prometheus exporter at `/metrics` (default port 9090) exposing connection counts, throughput, and backend health.
 
 ---
+
+## Development & Building
+
+Since this project uses Linux-specific APIs, development on macOS requires a containerized environment or VM.
+
+### Build with Docker
+
+```bash
+docker build -t pg_gateway .
+```
+
+### Build from Source (Linux)
+
+**Requirements:**
+- Linux Kernel 2.6.35+
+- `gcc`, `make`, `pkg-config`
+- `libpq-dev`
+
+```bash
+# Build dynamic binary
+make all
+
+# Build static binary (useful for distroless containers)
+make static
+
+# Run tests (requires Python 3 & pytest)
+make test
+```
 
 ## License
 
 MIT License – see [LICENSE](LICENSE) for details.
-
----
-
-## Contributing
-
-Contributions welcome! See [DEVELOPER.md](DEVELOPER.md) for setup instructions, testing guidelines, and development workflows.
