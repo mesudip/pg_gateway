@@ -1,5 +1,10 @@
 /*
  * forwarder.c - Connection forwarding logic for worker threads
+ *
+ * This module implements the core data forwarding loop for client-backend
+ * connections. It runs in worker threads, using epoll to monitor sockets
+ * and perform non-blocking I/O. It handles bidirectional data transfer
+ * ensuring low latency and high throughput for the PostgreSQL protocol.
  */
 
 #include "gateway.h"

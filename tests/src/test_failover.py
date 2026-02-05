@@ -264,45 +264,27 @@ class TestConnectionBehaviorDuringFailover:
         """Test gateway's handling of concurrent connections during cluster failover.
         
         This tests the GATEWAY's behavior:
-        - Connection pool resilience during primary change
-        - Connection routing after failover
-        - Handling of failed connections and reconnection
-        
-        Timeline:
-        - 0-5s: Gateway receives steady concurrent connections (baseline)
-        - 5s: Cluster primary fails over (patroni handles this)
-        - 5-15s: Gateway must route connections to new primary
-        - 15s: Stop load and analyze gateway's performance
+        - 0 failure before failover
+        - 0 failure after failover
+        - >0 successes during failover
         """
         num_workers = 5
-        total_duration = 15  # seconds
-        failover_trigger_at = 5  # seconds
         
         metrics = {
-            "before_failover": {"success": 0, "failed": 0, "errors": []},
-            "during_failover": {"success": 0, "failed": 0, "errors": []},
-            "after_failover": {"success": 0, "failed": 0, "errors": []},
+            "before_failover": {"success": 0, "failed": 0},
+            "during_failover": {"success": 0, "failed": 0},
+            "after_failover": {"success": 0, "failed": 0},
         }
         
-        start_time = time.time()
-        failover_triggered = False
+        phase_info = {"current": "before_failover"}
         stop_loop = False
 
         def worker():
             """Continuously attempt connections through gateway."""
             while not stop_loop:
-                elapsed = time.time() - start_time
-                
-                # Classify which phase we're in
-                if elapsed < failover_trigger_at:
-                    phase = "before_failover"
-                elif not failover_triggered or elapsed < failover_trigger_at + 3:
-                    phase = "during_failover"
-                else:
-                    phase = "after_failover"
+                phase = phase_info["current"]
                 
                 try:
-                    # Test gateway connection
                     conn = psycopg2.connect(
                         **gateway_connection_params,
                         connect_timeout=2
@@ -314,62 +296,45 @@ class TestConnectionBehaviorDuringFailover:
                     cursor.close()
                     conn.close()
                     metrics[phase]["success"] += 1
-                except psycopg2.OperationalError as e:
+                except Exception:
                     metrics[phase]["failed"] += 1
-                    metrics[phase]["errors"].append(str(e)[:50])
-                except Exception as e:
-                    metrics[phase]["failed"] += 1
-                    metrics[phase]["errors"].append(str(type(e).__name__))
                 
-                time.sleep(0.3)
+                time.sleep(0.1)
 
         # Start gateway load
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = [executor.submit(worker) for _ in range(num_workers)]
             
-            # Wait before triggering failover
-            time.sleep(failover_trigger_at)
+            # Phase 1: Before failover (5s)
+            time.sleep(5)
             
-            # Trigger cluster failover
-            print(f"\n[Gateway Test] Triggering cluster failover at {failover_trigger_at}s...")
-            try:
-                failover_triggered = patroni_cluster.trigger_failover()
-                if failover_triggered:
-                    print("[Gateway Test] Cluster failover initiated - gateway must handle primary change")
-            except Exception as e:
-                print(f"[Gateway Test] Failover trigger failed: {e}")
-                failover_triggered = False
+            # Phase 2: During failover
+            phase_info["current"] = "during_failover"
+            print(f"\n[Gateway Test] Triggering cluster failover...")
+            if not patroni_cluster.trigger_failover():
+                stop_loop = True
+                pytest.skip("Could not trigger failover")
             
-            # Continue load for remaining duration
-            remaining = total_duration - failover_trigger_at
-            time.sleep(remaining)
+            # Give enough time for failover and recovery (~30s)
+            time.sleep(30)
             
-            # Stop all workers
+            # Phase 3: After failover (10s)
+            phase_info["current"] = "after_failover"
+            time.sleep(10)
+            
             stop_loop = True
-            
-            # Wait for workers to finish
             for future in futures:
-                try:
-                    future.result(timeout=5)
-                except Exception as e:
-                    print(f"Worker error: {e}")
+                future.result()
 
         # Analyze gateway performance
         print(f"\n[Gateway Performance]")
-        print(f"  Before failover: {metrics['before_failover']['success']} success, {metrics['before_failover']['failed']} failed")
-        print(f"  During failover: {metrics['during_failover']['success']} success, {metrics['during_failover']['failed']} failed")
-        print(f"  After failover:  {metrics['after_failover']['success']} success, {metrics['after_failover']['failed']} failed")
+        for p in ["before_failover", "during_failover", "after_failover"]:
+            print(f"  {p.replace('_', ' ').capitalize()}: {metrics[p]['success']} success, {metrics[p]['failed']} failed")
         
-        total_success = sum(m["success"] for m in metrics.values())
-        total_attempted = sum(m["success"] + m["failed"] for m in metrics.values())
-        success_rate = (total_success / total_attempted * 100) if total_attempted > 0 else 0
-        print(f"  Total success rate: {success_rate:.1f}%")
-        
-        # Gateway should maintain high availability
-        assert metrics["before_failover"]["success"] > 0, "Gateway should handle connections normally before failover"
-        assert metrics["during_failover"]["success"] > 0 or metrics["after_failover"]["success"] > 0, \
-            "Gateway should recover connections during or after cluster failover"
-        assert success_rate > 70, f"Gateway success rate should be >70%, got {success_rate:.1f}%"
+        # User defined success criteria
+        assert metrics["before_failover"]["failed"] == 0, f"Expected 0 failures before failover, got {metrics['before_failover']['failed']}"
+        assert metrics["after_failover"]["failed"] == 0, f"Expected 0 failures after failover, got {metrics['after_failover']['failed']}"
+        assert metrics["during_failover"]["success"] > 0, "Expected at least one success during failover"
 
 
 @pytest.mark.failover

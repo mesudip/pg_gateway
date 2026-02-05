@@ -1,5 +1,10 @@
 /*
  * gateway.h - Shared declarations for pg_gateway
+ *
+ * This header file acts as the central hub for the project, defining
+ * global data structures, constants, configuration macros, and function
+ * prototypes. It includes necessary system headers and ensures consistent
+ * type definitions across all modules.
  */
 
 #ifndef GATEWAY_H

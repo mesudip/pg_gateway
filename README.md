@@ -6,21 +6,6 @@
 
 ---
 
-## Why pg_gateway?
-
-🚀 **Fast** – Built with `epoll` and `splice` for zero-copy TCP proxying  
-🎯 **Smart** – Automatically detects and routes to the current primary  
-🐳 **Cloud-Native** – Runs as a sidecar or standalone container  
-📊 **Battle-Tested** – Comprehensive test suite with failover scenarios  
-🔄 **HA-Ready** – Works seamlessly with Patroni, Stolon, and other HA solutions  
-
-### Performance
-
-Independent benchmarks show `pg_gateway` adds **30-70μs** overhead compared to direct connections—negligible for real-world workloads while providing automatic failover handling.
-
-[📊 View Live Benchmarks](https://mesudip.github.io/pg_gateway/benchmark/)
-
----
 
 ## Quick Start
 
@@ -52,7 +37,21 @@ Connect your application to `localhost:6432` and let `pg_gateway` handle primary
 - `<listen_port>` – Port to listen on (default: `6432`)
 
 ---
+## Why pg_gateway?
 
+🚀 **Fast** – Built with `epoll` and `splice` for zero-copy TCP proxying  
+🎯 **Smart** – Automatically detects and routes to the current primary  
+🐳 **Cloud-Native** – Runs as a sidecar or standalone container  
+📊 **Battle-Tested** – Comprehensive test suite with failover scenarios  
+🔄 **HA-Ready** – Works seamlessly with Patroni, Stolon, and other HA solutions  
+
+### Performance
+
+Independent benchmarks show `pg_gateway` adds **30-70μs** overhead compared to direct connections—negligible for real-world workloads while providing automatic failover handling.
+
+[📊 View Live Benchmarks](https://mesudip.github.io/pg_gateway/benchmark/)
+
+---
 ## Use Cases
 
 - **Kubernetes/Cloud** – Deploy as a sidecar to abstract primary routing from applications

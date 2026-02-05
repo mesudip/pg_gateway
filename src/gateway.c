@@ -1,5 +1,9 @@
 /*
  * gateway.c - Connection proxying and splice-based data transfer
+ *
+ * This file contains utility functions for creating pipes, connection utilities
+ * and constructing PostgreSQL protocol messages such as error packets.
+ * It serves as the low-level I/O toolkit used by the forwarder.
  */
 
 #include "gateway.h"

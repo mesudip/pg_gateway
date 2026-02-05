@@ -1,5 +1,10 @@
 /*
  * metrics.c - Prometheus metrics endpoint for pg_gateway
+ *
+ * This file implements an HTTP endpoint to expose internal performance
+ * metrics in a format compatible with Prometheus. It tracks statistics
+ * like active connections, data throughput, and server health status
+ * using atomic operations for thread safety.
  */
 
 #include "gateway.h"

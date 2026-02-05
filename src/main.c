@@ -1,6 +1,18 @@
 /*
  * main.c - Entry point and utilities for pg_gateway
  *
+ * This is the main application entry point. It initializes the global
+ * state, spawns worker threads for the forwarder, starts the health
+ * check background thread, and runs the main event loop which accepts
+ * incoming client connections.
+ *
+ * Module Interaction:
+ * - main.c orchestrates the startup and accepts connections.
+ * - Connections are dispatched to worker threads running code from forwarder.c.
+ * - health_check.c runs concurrently to updating the global routing table.
+ * - metrics.c provides an HTTP interface for monitoring the system.
+ * - gateway.c and gateway.h provide shared utilities and definitions.
+ *
  * Linux-only PostgreSQL TCP load balancer using zero-copy splice().
  *
  * Build:   make all

@@ -1,5 +1,11 @@
 /*
  * health_check.c - PostgreSQL primary health checking
+ *
+ * This module is responsible for monitoring the availability and status
+ * of potential PostgreSQL backends. It periodically polls candidate
+ * servers to identify the primary node, updating the global routing
+ * state so that new client connections are always directed to the
+ * active leader.
  */
 
 #include "gateway.h"
