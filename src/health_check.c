@@ -175,6 +175,14 @@ static bool check_postgres_primary(candidate_t *cand, int qto_ms, char *errbuf, 
     return is_primary;
 }
 
+static bool retry_postgres_primary(candidate_t *cand, int qto_ms, char *errbuf, size_t errlen) {
+    if (cand->health_conn != NULL) {
+        PQfinish(cand->health_conn);
+        cand->health_conn = NULL;
+    }
+    return check_postgres_primary(cand, qto_ms, errbuf, errlen);
+}
+
 static bool fetch_replica_lag_seconds(candidate_t *cand, double *lag_seconds, char *errbuf, size_t errlen) {
     if (!cand->health_conn || PQstatus(cand->health_conn) != CONNECTION_OK) {
         if (errbuf && errlen > 0) snprintf(errbuf, errlen, "replica lag connection unavailable");
@@ -232,6 +240,8 @@ void *health_thread_func(void *arg) {
         candidate_t found_cand = {0};
         bool ok = false;
         char errbuf[256] = {0};
+        int cur_idx = __atomic_load_n(&g_primary_idx, __ATOMIC_RELAXED);
+        bool current_primary_failed = false;
         
         // Clear statuses for this iteration
         memset(statuses, 0, g_ncand * sizeof(backend_status_t));
@@ -256,6 +266,10 @@ void *health_thread_func(void *arg) {
                     statuses[i].status = BACKEND_STATUS_PRIMARY_NOT_USED;
                 }
             } else {
+                if ((int)i == cur_idx) {
+                    current_primary_failed = true;
+                }
+
                 // Not a primary - determine if it's a replica or unhealthy
                 if (cand_reason[0] && strstr(cand_reason, "read-only")) {
                     double lag_seconds = 0.0;
@@ -279,6 +293,33 @@ void *health_thread_func(void *arg) {
                     snprintf(errbuf, sizeof(errbuf), "candidate %s:%s %s", 
                              g_candidates[i].host, g_candidates[i].port,
                              cand_reason[0] ? cand_reason : "not primary");
+                }
+            }
+        }
+
+        if (current_primary_failed && cur_idx >= 0 && cur_idx < (int)status_count) {
+            char retry_reason[256] = {0};
+            if (retry_postgres_primary(&g_candidates[cur_idx], qto, retry_reason, sizeof(retry_reason))) {
+                found_cand = g_candidates[cur_idx];
+                ok = true;
+
+                for (size_t i = 0; i < status_count; i++) {
+                    if ((int)i == cur_idx) {
+                        statuses[i].status = BACKEND_STATUS_PRIMARY;
+                        statuses[i].reason[0] = '\0';
+                    } else if (statuses[i].status == BACKEND_STATUS_PRIMARY) {
+                        statuses[i].status = BACKEND_STATUS_PRIMARY_NOT_USED;
+                    }
+                }
+            } else if (!ok) {
+                statuses[cur_idx].status = BACKEND_STATUS_UNHEALTHY;
+                strncpy(statuses[cur_idx].reason,
+                        retry_reason[0] ? retry_reason : "primary retry failed",
+                        sizeof(statuses[cur_idx].reason) - 1);
+                if (!errbuf[0]) {
+                    snprintf(errbuf, sizeof(errbuf), "candidate %s:%s %s",
+                             g_candidates[cur_idx].host, g_candidates[cur_idx].port,
+                             retry_reason[0] ? retry_reason : "primary retry failed");
                 }
             }
         }
@@ -331,8 +372,6 @@ void *health_thread_func(void *arg) {
                     break;
                 }
             }
-            
-            int cur_idx = __atomic_load_n(&g_primary_idx, __ATOMIC_RELAXED);
             if (new_idx != cur_idx) {
                 HLOG("Primary changed: old_idx=%d new_idx=%d", cur_idx, new_idx);
                 __atomic_store_n(&g_primary_idx, new_idx, __ATOMIC_RELEASE);
@@ -341,25 +380,26 @@ void *health_thread_func(void *arg) {
                 changed = true;
             }
         } else {
-            // Lost primary
-            int cur_idx = __atomic_load_n(&g_primary_idx, __ATOMIC_RELAXED);
             if (cur_idx >= 0) {
-                HLOG("Lost primary: old_idx=%d", cur_idx);
+                HLOG("Marking primary unhealthy after failed check and retry: old_idx=%d", cur_idx);
                 __atomic_store_n(&g_primary_idx, -1, __ATOMIC_RELEASE);
-                int new_epoch = __atomic_fetch_add(&g_epoch, 1, __ATOMIC_RELAXED) + 1;
-                HLOG("Epoch incremented to %d", new_epoch);
                 changed = true;
             }
         }
 
-        health_state_t new_state = ok ? HEALTH_HEALTHY : HEALTH_UNHEALTHY;
+        int effective_primary_idx = __atomic_load_n(&g_primary_idx, __ATOMIC_RELAXED);
+        health_state_t new_state = (effective_primary_idx >= 0) ? HEALTH_HEALTHY : HEALTH_UNHEALTHY;
         int e = __atomic_load_n(&g_epoch, __ATOMIC_RELAXED);
 
         // 4. Log state changes
         if (changed || new_state != last_state) {
-            if (ok) {
+            if (effective_primary_idx >= 0) {
                 warnx("[health] STATE CHANGE: %s -> HEALTHY primary %s (Epoch %d)",
-                      health_state_name(last_state), new_target.host_str, e);
+                      health_state_name(last_state),
+                      g_candidates[effective_primary_idx].target.host_str[0] ?
+                        g_candidates[effective_primary_idx].target.host_str :
+                        g_candidates[effective_primary_idx].host,
+                      e);
                 last_reason[0] = '\0';
             } else {
                 const char *reason = errbuf[0] ? errbuf : "no primary reachable";
@@ -370,7 +410,7 @@ void *health_thread_func(void *arg) {
             last_state = new_state;
         }
         
-        // 5. Print status of all backends when primary changes
+        // 5. Print status of all backends when primary changes or is marked failed
         if (changed) {
             warnx("[health] Backend Status:");
             for (size_t i = 0; i < status_count; i++) {
