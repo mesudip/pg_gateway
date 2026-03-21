@@ -75,6 +75,26 @@ clean:
 install: $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/pg_gateway
 
+CHROOT_DIR = $(BUILD_DIR)/chroot
+
+.PHONY: chroot
+chroot: $(TARGET)
+	@echo "Creating chroot environment in $(CHROOT_DIR)..."
+	@rm -rf $(CHROOT_DIR) && mkdir -p $(CHROOT_DIR)/usr/lib $(CHROOT_DIR)/etc/ssl/certs
+	@echo "hosts: files dns" > $(CHROOT_DIR)/etc/nsswitch.conf
+	@if [ -f /etc/ssl/certs/ca-certificates.crt ]; then \
+		cp /etc/ssl/certs/ca-certificates.crt $(CHROOT_DIR)/etc/ssl/certs/; \
+	fi
+	@cp $(TARGET) $(CHROOT_DIR)/pg_gateway
+	@echo "Copying interpreter (preserving path)..."
+	@ldd $(TARGET) | grep '/' | grep -v '=>' | awk '{print $$1}' | xargs -I '{}' cp -v --parents '{}' $(CHROOT_DIR)/
+	@echo "Copying shared libraries (flattening to /usr/lib)..."
+	@ldd $(TARGET) | grep '=>' | awk '{print $$3}' | sort -u | xargs -I '{}' cp -v -L '{}' $(CHROOT_DIR)/usr/lib/
+	@echo "Copying NSS and Resolver libraries (flattening to /usr/lib)..."
+	@find /lib /usr/lib -name 'libnss_dns.so*' -o -name 'libnss_files.so*' -o -name 'libresolv.so*' 2>/dev/null \
+		| sort -u | xargs -I '{}' cp -v -L '{}' $(CHROOT_DIR)/usr/lib/ || true
+	@echo "✓ Chroot environment layout complete."
+
 # Development targets
 debug: CFLAGS = -g -pthread -Wall -Wextra -DDEBUG
 debug: clean $(TARGET)
