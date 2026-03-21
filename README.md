@@ -43,6 +43,7 @@ Configuration is controlled via environment variables.
 | `CANDIDATES` | **Required.** Comma-separated list of backend PostgreSQL addresses. | - | `pg1:5432,pg2:5432` |
 | `LISTEN_HOST` | Interface address to bind the load balancer to. | `localhost` | `0.0.0.0` |
 | `LISTEN_PORT` | Port to accept client connections on. | `5432` | `6432` |
+| `PRIMARY_WAIT_SECS` | Seconds to wait for a primary after accepting a client when none is currently selected. If still unavailable after this delay, the gateway returns the usual PostgreSQL error response. | `3` | `5` |
 
 ### Health Checks
 

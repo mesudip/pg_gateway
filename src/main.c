@@ -118,6 +118,46 @@ bool sockaddr_equal(const struct sockaddr_storage *a, socklen_t a_len,
 
 static void hup_handler(int sig) { (void)sig; g_running = 0; }
 
+static int parse_primary_wait_seconds(void) {
+    const int default_wait_seconds = 3;
+    const char *env = getenv("PRIMARY_WAIT_SECS");
+    if (!env || !*env) return default_wait_seconds;
+
+    char *end = NULL;
+    long parsed = strtol(env, &end, 10);
+    if (end == env || *end != '\0') {
+        warnx("Invalid PRIMARY_WAIT_SECS='%s', using default %d", env, default_wait_seconds);
+        return default_wait_seconds;
+    }
+    if (parsed < 0) return 0;
+    if (parsed > 3600) return 3600;
+    return (int)parsed;
+}
+
+static int wait_for_primary_idx(int wait_seconds) {
+    int primary_idx = __atomic_load_n(&g_primary_idx, __ATOMIC_RELAXED);
+    if (primary_idx >= 0 && primary_idx < (int)g_ncand) return primary_idx;
+    if (wait_seconds <= 0) return primary_idx;
+
+    struct timespec start_ts;
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
+    long long deadline_ms = (long long)wait_seconds * 1000LL;
+
+    while (g_running) {
+        usleep(10 * 1000); // Poll for a primary every 10ms during the wait window
+        primary_idx = __atomic_load_n(&g_primary_idx, __ATOMIC_RELAXED);
+        if (primary_idx >= 0 && primary_idx < (int)g_ncand) return primary_idx;
+
+        struct timespec now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        long long elapsed_ms = (long long)(now_ts.tv_sec - start_ts.tv_sec) * 1000LL +
+                               (long long)(now_ts.tv_nsec - start_ts.tv_nsec) / 1000000LL;
+        if (elapsed_ms >= deadline_ms) break;
+    }
+
+    return primary_idx;
+}
+
 /* --- Main --- */
 
 int main(int argc, char **argv) {
@@ -146,6 +186,8 @@ int main(int argc, char **argv) {
     if (num_threads_env) g_num_workers = atoi(num_threads_env);
     if (g_num_workers < 1) g_num_workers = 1;
     if (g_num_workers > 64) g_num_workers = 64;
+
+    int primary_wait_seconds = parse_primary_wait_seconds();
     
     struct sigaction sa = {0};
     sa.sa_handler = hup_handler;
@@ -252,8 +294,8 @@ int main(int argc, char **argv) {
         }
         set_tcp_opts(cfd);
         
-        // Fetch Primary
-        int primary_idx = __atomic_load_n(&g_primary_idx, __ATOMIC_RELAXED);
+        // Fetch Primary (optionally wait briefly during failover/no-primary windows)
+        int primary_idx = wait_for_primary_idx(primary_wait_seconds);
         int cur_epoch = __atomic_load_n(&g_epoch, __ATOMIC_RELAXED);
         
         DEBUG_LOG("Accept: primary_idx=%d epoch=%d", primary_idx, cur_epoch);
