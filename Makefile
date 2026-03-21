@@ -10,8 +10,8 @@ BUILD_DIR = build
 TARGET = $(BUILD_DIR)/pg_gateway
 TARGET_STATIC = $(BUILD_DIR)/pg_gateway-static
 
-SOURCES = $(SRC_DIR)/main.c $(SRC_DIR)/gateway.c $(SRC_DIR)/health_check.c $(SRC_DIR)/metrics.c $(SRC_DIR)/forwarder.c
-OBJECTS = $(BUILD_DIR)/main.o $(BUILD_DIR)/gateway.o $(BUILD_DIR)/health_check.o $(BUILD_DIR)/metrics.o $(BUILD_DIR)/forwarder.o
+SOURCES = $(SRC_DIR)/main.c $(SRC_DIR)/gateway.c $(SRC_DIR)/health_check.c $(SRC_DIR)/health_snapshot.c $(SRC_DIR)/metrics.c $(SRC_DIR)/forwarder.c
+OBJECTS = $(BUILD_DIR)/main.o $(BUILD_DIR)/gateway.o $(BUILD_DIR)/health_check.o $(BUILD_DIR)/health_snapshot.o $(BUILD_DIR)/metrics.o $(BUILD_DIR)/forwarder.o
 
 .PHONY: all clean install static venv test
 
@@ -60,7 +60,7 @@ static: $(TARGET_STATIC)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c $(SRC_DIR)/gateway.h | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c $(SRC_DIR)/gateway.h $(SRC_DIR)/health_snapshot.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(TARGET): $(OBJECTS)

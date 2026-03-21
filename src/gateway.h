@@ -125,7 +125,6 @@ void metrics_inc_active_connections(void);
 void metrics_dec_active_connections(void);
 void metrics_add_bytes_c2b(ssize_t delta);
 void metrics_add_bytes_b2c(ssize_t delta);
-void metrics_set_server_counts(int total, int healthy);
 
 /* --- Gateway Functions (gateway.c) --- */
 void send_pg_error(int fd, const char *message);

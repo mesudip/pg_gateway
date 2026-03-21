@@ -13,21 +13,39 @@ METRICS_URL = f"http://{GATEWAY_HOST}:{METRICS_PORT}/metrics"
 class TestMetrics:
     """Test Prometheus metrics endpoint."""
 
-    def get_metrics(self):
-        """Fetch and parse metrics."""
+    def get_metrics_response(self):
         response = requests.get(METRICS_URL)
         assert response.status_code == 200
-        lines = response.text.splitlines()
+        return response
+
+    def parse_metrics_response(self, response):
         metrics = {}
-        for line in lines:
+        lag_series = {}
+
+        for line in response.text.splitlines():
+            if line.startswith("pg_gateway_replica_lag_seconds{"):
+                metric, value = line.split()
+                backend = metric.split('backend="', 1)[1].split('"', 1)[0]
+                lag_series[backend] = float(value)
+                continue
+
             if line.startswith("#") or not line.strip():
                 continue
+
             parts = line.split()
             if len(parts) >= 2:
-                key = parts[0]
-                value = float(parts[1])
-                metrics[key] = value
+                metrics[parts[0]] = float(parts[1])
+
+        return metrics, lag_series
+
+    def get_metrics(self):
+        """Fetch and parse metrics."""
+        metrics, _ = self.parse_metrics_response(self.get_metrics_response())
         return metrics
+
+    def get_replica_lag_series(self):
+        _, lag_series = self.parse_metrics_response(self.get_metrics_response())
+        return lag_series
 
     def test_when_metrics_endpoint_is_accessed_then_it_is_reachable(self, patroni_cluster):
         """Test that metrics endpoint is up and returns 200 OK."""
@@ -98,6 +116,29 @@ class TestMetrics:
         assert healthy > 0
         assert unhealthy == total - healthy
 
+    def test_when_metrics_are_checked_then_replica_lag_is_exposed(self, patroni_cluster):
+        """Test that replica lag gauge is exported for replica backends."""
+        lag_series = self.get_replica_lag_series()
+        assert lag_series, "Expected replica lag metrics for at least one replica"
+
+        expected_backends = {"patroni1:5432", "patroni2:5432", "patroni3:5432"}
+        assert set(lag_series).issubset(expected_backends)
+        assert len(lag_series) == len(set(lag_series))
+
+        for lag_seconds in lag_series.values():
+            assert lag_seconds >= 0.0
+
+    def test_when_metrics_are_scraped_then_lag_series_match_the_reported_snapshot(self, patroni_cluster):
+        """Test that one scrape exposes a coherent snapshot of counts and backend lag labels."""
+        metrics, lag_series = self.parse_metrics_response(self.get_metrics_response())
+
+        total = metrics["pg_gateway_servers_total"]
+        healthy = metrics["pg_gateway_servers_healthy"]
+
+        assert len(lag_series) <= total
+        assert len(lag_series) <= healthy
+        assert all(backend in {"patroni1:5432", "patroni2:5432", "patroni3:5432"} for backend in lag_series)
+
     def test_when_node_stops_then_healthy_server_count_decreases(self):
         """Test that server health metrics update when a node goes down and comes back up."""
         import subprocess
@@ -137,6 +178,7 @@ class TestMetrics:
             m_new = self.get_metrics()
             healthy_new = m_new.get("pg_gateway_servers_healthy", 0)
             unhealthy_new = m_new.get("pg_gateway_servers_unhealthy", 0)
+            lag_series_new = self.get_replica_lag_series()
             
             # Verify shift from healthy to unhealthy
             # Ensure we don't go below 0
@@ -144,6 +186,7 @@ class TestMetrics:
             
             assert healthy_new == expected_healthy
             assert unhealthy_new == unhealthy_base + 1
+            assert "patroni3:5432" not in lag_series_new
             
         finally:
             # Restore the cluster state
@@ -154,9 +197,9 @@ class TestMetrics:
             
             m_final = self.get_metrics()
             healthy_final = m_final.get("pg_gateway_servers_healthy", 0)
+            lag_series_final = self.get_replica_lag_series()
             
             # We only check if it recovered at least partially
             # It might not reach full 3 immediately if leadership changed
             assert healthy_final > healthy_new
-
-
+            assert len(lag_series_final) > len(lag_series_new)

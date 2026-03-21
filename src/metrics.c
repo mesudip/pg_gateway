@@ -8,6 +8,7 @@
  */
 
 #include "gateway.h"
+#include "health_snapshot.h"
 
 /* --- Metrics Counters (atomic for thread safety) --- */
 
@@ -15,8 +16,6 @@ static _Atomic long g_active_connections = 0;
 static _Atomic long g_total_connections = 0;
 static _Atomic long g_bytes_client_to_backend = 0;
 static _Atomic long g_bytes_backend_to_client = 0;
-static _Atomic int g_servers_total = 0;
-static _Atomic int g_servers_healthy = 0;
 
 /* --- Metrics Update Functions --- */
 
@@ -35,11 +34,6 @@ void metrics_add_bytes_c2b(ssize_t delta) {
 
 void metrics_add_bytes_b2c(ssize_t delta) {
     if (delta > 0) __atomic_add_fetch(&g_bytes_backend_to_client, delta, __ATOMIC_RELAXED);
-}
-
-void metrics_set_server_counts(int total, int healthy) {
-    __atomic_store_n(&g_servers_total, total, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_servers_healthy, healthy, __ATOMIC_RELAXED);
 }
 
 /* --- HTTP Response Helpers --- */
@@ -64,13 +58,14 @@ static void handle_metrics_request(int fd) {
     long total_conn = __atomic_load_n(&g_total_connections, __ATOMIC_RELAXED);
     long bytes_c2b = __atomic_load_n(&g_bytes_client_to_backend, __ATOMIC_RELAXED);
     long bytes_b2c = __atomic_load_n(&g_bytes_backend_to_client, __ATOMIC_RELAXED);
-    int servers_total = __atomic_load_n(&g_servers_total, __ATOMIC_RELAXED);
-    int servers_healthy = __atomic_load_n(&g_servers_healthy, __ATOMIC_RELAXED);
+    const health_metrics_snapshot_t *snapshot = health_snapshot_acquire();
+    int servers_total = snapshot ? snapshot->servers_total : 0;
+    int servers_healthy = snapshot ? snapshot->servers_healthy : 0;
     
     int servers_unhealthy = servers_total - servers_healthy;
     
-    char body[4096];
-    snprintf(body, sizeof(body),
+    char body[8192];
+    int len = snprintf(body, sizeof(body),
         "# HELP pg_gateway_connections_active Current number of active connections\n"
         "# TYPE pg_gateway_connections_active gauge\n"
         "pg_gateway_connections_active %ld\n"
@@ -100,8 +95,43 @@ static void handle_metrics_request(int fd) {
         "pg_gateway_servers_unhealthy %d\n",
         active, total_conn, bytes_c2b, bytes_b2c,
         servers_total, servers_healthy, servers_unhealthy);
+
+    if (len < 0 || (size_t)len >= sizeof(body)) {
+        health_snapshot_release(snapshot);
+        send_http_response(fd, "500 Internal Server Error", "text/plain", "metrics render failed\n");
+        return;
+    }
+
+
+    if (snapshot) {
+        int written = snprintf(body + len, sizeof(body) - (size_t)len,
+            "\n# HELP pg_gateway_replica_lag_seconds Replica replay lag in seconds for replica backends\n"
+            "# TYPE pg_gateway_replica_lag_seconds gauge\n");
+        if (written < 0 || (size_t)written >= sizeof(body) - (size_t)len) {
+            health_snapshot_release(snapshot);
+            send_http_response(fd, "500 Internal Server Error", "text/plain", "metrics render failed\n");
+            return;
+        }
+        len += written;
+
+        for (size_t i = 0; i < snapshot->backend_count; i++) {
+            const health_backend_snapshot_t *backend = &snapshot->backends[i];
+            if (backend->status != BACKEND_STATUS_REPLICA || backend->replica_lag_seconds < 0.0) continue;
+
+            written = snprintf(body + len, sizeof(body) - (size_t)len,
+                "pg_gateway_replica_lag_seconds{backend=\"%s:%s\"} %.6f\n",
+                backend->host, backend->port, backend->replica_lag_seconds);
+            if (written < 0 || (size_t)written >= sizeof(body) - (size_t)len) {
+                health_snapshot_release(snapshot);
+                send_http_response(fd, "500 Internal Server Error", "text/plain", "metrics render failed\n");
+                return;
+            }
+            len += written;
+        }
+    }
     
     send_http_response(fd, "200 OK", "text/plain; version=0.0.4; charset=utf-8", body);
+    health_snapshot_release(snapshot);
 }
 
 /* --- Metrics Server Thread --- */

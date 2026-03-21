@@ -9,6 +9,7 @@
  */
 
 #include "gateway.h"
+#include "health_snapshot.h"
 
 /* --- Health State --- */
 
@@ -37,6 +38,31 @@ static const char *health_state_name(health_state_t s) {
         case HEALTH_UNHEALTHY: return "UNHEALTHY";
         default: return "UNKNOWN";
     }
+}
+
+static const char *status_names[] = {
+    "Primary",
+    "Primary(not-used)",
+    "Replica",
+    "Unhealthy"
+};
+
+static void publish_initial_health_snapshot(void) {
+    health_metrics_snapshot_t *snapshot = health_snapshot_alloc(g_ncand);
+    if (!snapshot) {
+        warnx("[health] Failed to allocate initial health snapshot");
+        return;
+    }
+
+    for (size_t i = 0; i < g_ncand; i++) {
+        snprintf(snapshot->backends[i].host, sizeof(snapshot->backends[i].host), "%s", g_candidates[i].host);
+        snprintf(snapshot->backends[i].port, sizeof(snapshot->backends[i].port), "%s", g_candidates[i].port);
+        snapshot->backends[i].status = BACKEND_STATUS_UNHEALTHY;
+        snapshot->backends[i].replica_lag_seconds = -1.0;
+        snprintf(snapshot->backends[i].reason, sizeof(snapshot->backends[i].reason), "initializing");
+    }
+
+    health_snapshot_publish(snapshot);
 }
 
 /* --- Candidate Parsing --- */
@@ -84,7 +110,7 @@ void parse_candidates(const char *s) {
     for (size_t i = 0; i < g_ncand; i++) {
         warnx("[config] backend[%zu]=%s:%s", i, g_candidates[i].host, g_candidates[i].port);
     }
-    metrics_set_server_counts((int)g_ncand, 0);
+    publish_initial_health_snapshot();
 }
 
 /* --- Primary Check --- */
@@ -149,29 +175,41 @@ static bool check_postgres_primary(candidate_t *cand, int qto_ms, char *errbuf, 
     return is_primary;
 }
 
+static bool fetch_replica_lag_seconds(candidate_t *cand, double *lag_seconds, char *errbuf, size_t errlen) {
+    if (!cand->health_conn || PQstatus(cand->health_conn) != CONNECTION_OK) {
+        if (errbuf && errlen > 0) snprintf(errbuf, errlen, "replica lag connection unavailable");
+        return false;
+    }
+
+    PGresult *res = PQexec(cand->health_conn,
+        "SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()));");
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (errbuf && errlen > 0) snprintf(errbuf, errlen, "replica lag check failed: %s", PQerrorMessage(cand->health_conn));
+        PQclear(res);
+        PQfinish(cand->health_conn);
+        cand->health_conn = NULL;
+        return false;
+    }
+
+    if (PQgetisnull(res, 0, 0)) {
+        *lag_seconds = 0.0;
+    } else {
+        char *val = PQgetvalue(res, 0, 0);
+        *lag_seconds = val ? strtod(val, NULL) : 0.0;
+    }
+
+    PQclear(res);
+    return true;
+}
+
 /* --- Health Thread --- */
 
-// Backend status enum
-typedef enum {
-    STATUS_PRIMARY = 0,
-    STATUS_PRIMARY_NOT_USED,
-    STATUS_REPLICA,
-    STATUS_UNHEALTHY
-} backend_status_enum_t;
-
-static const char *status_names[] = {
-    "Primary",
-    "Primary(not-used)",
-    "Replica",
-    "Unhealthy"
-};
-
-// Backend status structure for health tracking
 typedef struct {
     const char *host;
     const char *port;
     backend_status_enum_t status;
     char reason[256];
+    double replica_lag_seconds;
 } backend_status_t;
 
 void *health_thread_func(void *arg) {
@@ -204,6 +242,7 @@ void *health_thread_func(void *arg) {
             HLOG("Checking candidate[%zu]: %s:%s", i, g_candidates[i].host, g_candidates[i].port);
             statuses[i].host = g_candidates[i].host;
             statuses[i].port = g_candidates[i].port;
+            statuses[i].replica_lag_seconds = -1.0;
             
             char cand_reason[256] = {0};
             if (check_postgres_primary(&g_candidates[i], qto, cand_reason, sizeof(cand_reason))) {
@@ -211,21 +250,28 @@ void *health_thread_func(void *arg) {
                 if (!ok) {  // Take the first primary found
                     found_cand = g_candidates[i];
                     ok = true;
-                    statuses[i].status = STATUS_PRIMARY;
+                    statuses[i].status = BACKEND_STATUS_PRIMARY;
                 } else {
                     // Another primary found (split brain?)
-                    statuses[i].status = STATUS_PRIMARY_NOT_USED;
+                    statuses[i].status = BACKEND_STATUS_PRIMARY_NOT_USED;
                 }
             } else {
                 // Not a primary - determine if it's a replica or unhealthy
                 if (cand_reason[0] && strstr(cand_reason, "read-only")) {
-                    statuses[i].status = STATUS_REPLICA;
-                    strncpy(statuses[i].reason, "read-only", sizeof(statuses[i].reason) - 1);
+                    double lag_seconds = 0.0;
+                    char lag_err[256] = {0};
+                    statuses[i].status = BACKEND_STATUS_REPLICA;
+                    if (fetch_replica_lag_seconds(&g_candidates[i], &lag_seconds, lag_err, sizeof(lag_err))) {
+                        statuses[i].replica_lag_seconds = lag_seconds;
+                        snprintf(statuses[i].reason, sizeof(statuses[i].reason), "read-only lag=%.3fs", lag_seconds);
+                    } else {
+                        strncpy(statuses[i].reason, lag_err[0] ? lag_err : "read-only", sizeof(statuses[i].reason) - 1);
+                    }
                 } else if (cand_reason[0]) {
-                    statuses[i].status = STATUS_UNHEALTHY;
+                    statuses[i].status = BACKEND_STATUS_UNHEALTHY;
                     strncpy(statuses[i].reason, cand_reason, sizeof(statuses[i].reason) - 1);
                 } else {
-                    statuses[i].status = STATUS_UNHEALTHY;
+                    statuses[i].status = BACKEND_STATUS_UNHEALTHY;
                     strncpy(statuses[i].reason, "check failed", sizeof(statuses[i].reason) - 1);
                 }
                 
@@ -240,11 +286,27 @@ void *health_thread_func(void *arg) {
         // Count healthy servers and update metrics
         int healthy_count = 0;
         for (size_t i = 0; i < status_count; i++) {
-            if (statuses[i].status != STATUS_UNHEALTHY) {
+            if (statuses[i].status != BACKEND_STATUS_UNHEALTHY) {
                 healthy_count++;
             }
         }
-        metrics_set_server_counts((int)status_count, healthy_count);
+
+        health_metrics_snapshot_t *snapshot = health_snapshot_alloc(status_count);
+        if (!snapshot) {
+            warnx("[health] Failed to allocate health snapshot");
+        } else {
+            snapshot->servers_healthy = healthy_count;
+            for (size_t i = 0; i < status_count; i++) {
+                snprintf(snapshot->backends[i].host, sizeof(snapshot->backends[i].host), "%s", statuses[i].host);
+                snprintf(snapshot->backends[i].port, sizeof(snapshot->backends[i].port), "%s", statuses[i].port);
+                snapshot->backends[i].status = statuses[i].status;
+                snapshot->backends[i].replica_lag_seconds = statuses[i].replica_lag_seconds;
+                if (statuses[i].reason[0]) {
+                    snprintf(snapshot->backends[i].reason, sizeof(snapshot->backends[i].reason), "%s", statuses[i].reason);
+                }
+            }
+            health_snapshot_publish(snapshot);
+        }
 
         // 2. Resolve DNS (off the main loop)
         target_addr_t new_target = {0};
